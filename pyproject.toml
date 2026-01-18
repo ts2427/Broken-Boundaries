@@ -1,0 +1,13 @@
+[project]
+name = "broken-boundaries"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.14"
+dependencies = [
+    "numpy>=2.4.1",
+    "pandas>=2.3.3",
+    "praw>=7.8.1",
+    "python-dotenv>=1.2.1",
+    "requests>=2.32.5",
+    "yfinance>=1.0",
+]
