@@ -273,9 +273,52 @@ def enrich_with_stock_data(df: pd.DataFrame) -> pd.DataFrame:
     )
     df = df.drop(columns=['stock_ticker_upper', '_original_ticker'])
 
+    # Add ticker status columns
+    df = add_ticker_status(df)
+
     # Count enriched records
     enriched_count = df['yf_ticker'].notna().sum()
     print(f"\nEnriched {enriched_count} records with stock data")
+
+    return df
+
+
+def add_ticker_status(df: pd.DataFrame) -> pd.DataFrame:
+    """Add ticker_status and ticker_status_note columns to track ticker state."""
+
+    def get_status(row):
+        ticker = row.get('stock_ticker')
+        if pd.isna(ticker) or ticker == 'nan':
+            return 'no_ticker', None
+
+        ticker_upper = str(ticker).upper().strip()
+
+        # Check if delisted
+        if ticker_upper in DELISTED_TICKERS:
+            return 'delisted', DELISTED_TICKERS[ticker_upper]
+
+        # Check if mapped
+        if ticker_upper in TICKER_MAPPING:
+            new_ticker = TICKER_MAPPING[ticker_upper]
+            return 'mapped', f"{ticker_upper} -> {new_ticker}"
+
+        # Check if we have stock data
+        if pd.notna(row.get('yf_ticker')):
+            return 'active', None
+
+        return 'not_found', 'Ticker not found on Yahoo Finance'
+
+    # Apply status to each row
+    statuses = df.apply(get_status, axis=1)
+    df['ticker_status'] = [s[0] for s in statuses]
+    df['ticker_status_note'] = [s[1] for s in statuses]
+
+    # Print summary
+    print("\nTicker status summary:")
+    for status in ['active', 'mapped', 'delisted', 'not_found', 'no_ticker']:
+        count = (df['ticker_status'] == status).sum()
+        if count > 0:
+            print(f"  - {status}: {count} records")
 
     return df
 
@@ -587,6 +630,21 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "float64",
                 "nullable": True,
                 "description": "Total cash and equivalents in USD",
+            },
+            # --- Ticker Status Tracking ---
+            "ticker_status": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(20)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Status of ticker: active, mapped, delisted, not_found, no_ticker",
+            },
+            "ticker_status_note": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(200)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Details about ticker status (e.g., 'Acquired by Microsoft (2023)', 'SQ -> XYZ')",
             },
         },
     }
