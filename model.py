@@ -244,6 +244,214 @@ def get_descriptive_stats(db_path: Optional[Path] = None) -> Dict[str, Any]:
     return stats
 
 
+def run_full_descriptive_statistics(db_path: Optional[Path] = None) -> Dict[str, Any]:
+    """
+    Run comprehensive descriptive statistics on ALL data columns.
+    Returns detailed statistics for numeric, categorical, and date columns.
+    """
+    # Get all data
+    df = query_df("SELECT * FROM breach_incidents", db_path=db_path)
+
+    results = {
+        'overview': {},
+        'numeric': {},
+        'categorical': {},
+        'date': {},
+        'news_sources': {},
+        'stock_data': {},
+    }
+
+    # === OVERVIEW ===
+    results['overview'] = {
+        'total_records': len(df),
+        'total_columns': len(df.columns),
+        'memory_usage_mb': df.memory_usage(deep=True).sum() / 1024 / 1024,
+    }
+
+    # === NUMERIC COLUMNS ===
+    numeric_cols = [
+        'total_affected', 'total_news_count',
+        'reddit_count', 'guardian_count', 'nyt_count', 'newsapi_count',
+        'yf_market_cap', 'yf_enterprise_value', 'yf_employee_count',
+        'yf_revenue', 'yf_net_income', 'yf_total_debt', 'yf_total_cash',
+        'yf_current_price', 'yf_52_week_high', 'yf_52_week_low',
+        'yf_50_day_avg', 'yf_200_day_avg', 'yf_beta', 'yf_pe_ratio',
+        'yf_dividend_yield', 'yf_profit_margin', 'yf_operating_margin',
+    ]
+
+    for col in numeric_cols:
+        if col in df.columns:
+            series = pd.to_numeric(df[col], errors='coerce')
+            valid = series.dropna()
+            if len(valid) > 0:
+                results['numeric'][col] = {
+                    'count': len(valid),
+                    'missing': len(df) - len(valid),
+                    'missing_pct': round((len(df) - len(valid)) / len(df) * 100, 2),
+                    'mean': round(valid.mean(), 2),
+                    'std': round(valid.std(), 2),
+                    'min': valid.min(),
+                    'q25': round(valid.quantile(0.25), 2),
+                    'median': round(valid.median(), 2),
+                    'q75': round(valid.quantile(0.75), 2),
+                    'max': valid.max(),
+                    'skewness': round(valid.skew(), 2),
+                    'kurtosis': round(valid.kurtosis(), 2),
+                }
+
+    # === CATEGORICAL COLUMNS ===
+    categorical_cols = [
+        'breach_type', 'yf_sector', 'yf_industry', 'ticker_status',
+        'yf_country', 'yf_exchange',
+    ]
+
+    for col in categorical_cols:
+        if col in df.columns:
+            series = df[col].dropna()
+            if len(series) > 0:
+                value_counts = series.value_counts()
+                results['categorical'][col] = {
+                    'count': len(series),
+                    'missing': len(df) - len(series),
+                    'missing_pct': round((len(df) - len(series)) / len(df) * 100, 2),
+                    'unique': series.nunique(),
+                    'mode': value_counts.index[0] if len(value_counts) > 0 else None,
+                    'mode_count': int(value_counts.iloc[0]) if len(value_counts) > 0 else 0,
+                    'top_5': value_counts.head(5).to_dict(),
+                }
+
+    # === DATE COLUMNS ===
+    date_cols = ['breach_date', 'end_breach_date', 'reported_date']
+
+    for col in date_cols:
+        if col in df.columns:
+            series = pd.to_datetime(df[col], errors='coerce')
+            valid = series.dropna()
+            if len(valid) > 0:
+                results['date'][col] = {
+                    'count': len(valid),
+                    'missing': len(df) - len(valid),
+                    'missing_pct': round((len(df) - len(valid)) / len(df) * 100, 2),
+                    'earliest': str(valid.min().date()),
+                    'latest': str(valid.max().date()),
+                    'range_days': (valid.max() - valid.min()).days,
+                    'median': str(valid.median().date()),
+                }
+
+    # === NEWS SOURCES BREAKDOWN ===
+    news_cols = ['reddit_count', 'guardian_count', 'nyt_count', 'newsapi_count']
+    total_news = 0
+    for col in news_cols:
+        if col in df.columns:
+            col_sum = pd.to_numeric(df[col], errors='coerce').fillna(0).sum()
+            results['news_sources'][col.replace('_count', '')] = int(col_sum)
+            total_news += col_sum
+    results['news_sources']['total'] = int(total_news)
+
+    # === STOCK DATA COVERAGE ===
+    stock_cols = ['stock_ticker', 'yf_company_name', 'yf_sector', 'yf_market_cap']
+    results['stock_data']['has_ticker'] = int(df['stock_ticker'].notna().sum()) if 'stock_ticker' in df.columns else 0
+    results['stock_data']['has_yf_data'] = int(df['yf_company_name'].notna().sum()) if 'yf_company_name' in df.columns else 0
+
+    if 'ticker_status' in df.columns:
+        status_counts = df['ticker_status'].value_counts().to_dict()
+        results['stock_data']['ticker_status'] = {k: int(v) for k, v in status_counts.items()}
+
+    return results
+
+
+def print_full_descriptive_statistics(db_path: Optional[Path] = None):
+    """Print comprehensive descriptive statistics report."""
+    stats = run_full_descriptive_statistics(db_path)
+
+    print("=" * 80)
+    print("COMPREHENSIVE DESCRIPTIVE STATISTICS REPORT")
+    print("=" * 80)
+    print(f"Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print()
+
+    # Overview
+    print("=" * 80)
+    print("DATASET OVERVIEW")
+    print("=" * 80)
+    print(f"Total Records: {stats['overview']['total_records']:,}")
+    print(f"Total Columns: {stats['overview']['total_columns']}")
+    print(f"Memory Usage: {stats['overview']['memory_usage_mb']:.2f} MB")
+    print()
+
+    # Numeric Variables
+    print("=" * 80)
+    print("NUMERIC VARIABLES")
+    print("=" * 80)
+
+    for col, s in stats['numeric'].items():
+        print(f"\n{col.upper()}")
+        print("-" * 60)
+        print(f"  Count: {s['count']:,}  |  Missing: {s['missing']:,} ({s['missing_pct']}%)")
+        print(f"  Mean: {s['mean']:,.2f}  |  Std: {s['std']:,.2f}")
+        print(f"  Min: {s['min']:,.2f}  |  Max: {s['max']:,.2f}")
+        print(f"  Q25: {s['q25']:,.2f}  |  Median: {s['median']:,.2f}  |  Q75: {s['q75']:,.2f}")
+        print(f"  Skewness: {s['skewness']}  |  Kurtosis: {s['kurtosis']}")
+
+    # Categorical Variables
+    print()
+    print("=" * 80)
+    print("CATEGORICAL VARIABLES")
+    print("=" * 80)
+
+    for col, s in stats['categorical'].items():
+        print(f"\n{col.upper()}")
+        print("-" * 60)
+        print(f"  Count: {s['count']:,}  |  Missing: {s['missing']:,} ({s['missing_pct']}%)")
+        print(f"  Unique Values: {s['unique']}")
+        print(f"  Mode: {s['mode']} (n={s['mode_count']:,})")
+        print(f"  Top 5 Values:")
+        for val, count in s['top_5'].items():
+            print(f"    - {val}: {count:,}")
+
+    # Date Variables
+    print()
+    print("=" * 80)
+    print("DATE VARIABLES")
+    print("=" * 80)
+
+    for col, s in stats['date'].items():
+        print(f"\n{col.upper()}")
+        print("-" * 60)
+        print(f"  Count: {s['count']:,}  |  Missing: {s['missing']:,} ({s['missing_pct']}%)")
+        print(f"  Earliest: {s['earliest']}  |  Latest: {s['latest']}")
+        print(f"  Range: {s['range_days']:,} days")
+        print(f"  Median: {s['median']}")
+
+    # News Sources
+    print()
+    print("=" * 80)
+    print("NEWS DATA SUMMARY")
+    print("=" * 80)
+    print(f"  Reddit Articles: {stats['news_sources'].get('reddit', 0):,}")
+    print(f"  Guardian Articles: {stats['news_sources'].get('guardian', 0):,}")
+    print(f"  NYT Articles: {stats['news_sources'].get('nyt', 0):,}")
+    print(f"  NewsAPI Articles: {stats['news_sources'].get('newsapi', 0):,}")
+    print(f"  TOTAL: {stats['news_sources'].get('total', 0):,}")
+
+    # Stock Data Coverage
+    print()
+    print("=" * 80)
+    print("STOCK DATA COVERAGE")
+    print("=" * 80)
+    print(f"  Records with Ticker: {stats['stock_data']['has_ticker']:,}")
+    print(f"  Records with Yahoo Finance Data: {stats['stock_data']['has_yf_data']:,}")
+    if 'ticker_status' in stats['stock_data']:
+        print(f"  Ticker Status Breakdown:")
+        for status, count in stats['stock_data']['ticker_status'].items():
+            print(f"    - {status}: {count:,}")
+
+    print()
+    print("=" * 80)
+
+    return stats
+
+
 def analyze_trends(db_path: Optional[Path] = None) -> pd.DataFrame:
     """Analyze yearly trends in breach data."""
     df = query_df("""
