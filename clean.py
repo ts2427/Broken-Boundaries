@@ -8,6 +8,7 @@ import pandas as pd
 import numpy as np
 import yfinance as yf
 import requests
+import praw
 import time
 import os
 import json
@@ -18,6 +19,21 @@ from dotenv import load_dotenv
 
 # Load environment variables for API keys
 load_dotenv()
+
+# Initialize Reddit client (if credentials available)
+REDDIT_CLIENT_ID = os.getenv("REDDIT_CLIENT_ID", "")
+REDDIT_CLIENT_SECRET = os.getenv("REDDIT_CLIENT_SECRET", "")
+REDDIT_CLIENT = None
+
+if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
+    try:
+        REDDIT_CLIENT = praw.Reddit(
+            client_id=REDDIT_CLIENT_ID,
+            client_secret=REDDIT_CLIENT_SECRET,
+            user_agent="BrokenBoundaries/1.0 (academic research)"
+        )
+    except Exception as e:
+        print(f"Warning: Could not initialize Reddit client: {e}")
 
 
 # === Configuration ===
@@ -352,46 +368,37 @@ NEWS_END_DATE = "2025-12-31"
 
 def fetch_reddit_news(company_name: str, limit: int = 10) -> list:
     """
-    Fetch news posts from Reddit about a company.
-    Note: Reddit now requires OAuth for API access. This function attempts
-    the public endpoint but may return empty results due to rate limiting.
-    For production use, consider using PRAW with Reddit API credentials.
+    Fetch news posts from Reddit about a company using PRAW (OAuth).
+    Requires REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET in .env
     """
     articles = []
-    try:
-        # Search in news and business subreddits
-        search_query = f"{company_name} breach OR hack OR data"
-        url = "https://www.reddit.com/search.json"
-        params = {
-            "q": search_query,
-            "sort": "relevance",
-            "limit": limit,
-            "restrict_sr": False,
-            "t": "all"  # All time
-        }
-        headers = {
-            "User-Agent": "BrokenBoundaries/1.0 (academic research; contact@example.com)"
-        }
 
-        response = requests.get(url, params=params, headers=headers, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            for post in data.get("data", {}).get("children", []):
-                post_data = post.get("data", {})
-                articles.append({
-                    "source": "reddit",
-                    "title": post_data.get("title", ""),
-                    "url": f"https://reddit.com{post_data.get('permalink', '')}",
-                    "published_date": datetime.fromtimestamp(
-                        post_data.get("created_utc", 0)
-                    ).strftime("%Y-%m-%d") if post_data.get("created_utc") else None,
-                    "subreddit": post_data.get("subreddit", ""),
-                    "score": post_data.get("score", 0),
-                    "num_comments": post_data.get("num_comments", 0),
-                })
-        elif response.status_code == 403:
-            pass  # Reddit API requires auth, skip silently
-        time.sleep(1)  # Rate limiting
+    if not REDDIT_CLIENT:
+        return articles
+
+    try:
+        # Search for posts about the company breach
+        search_query = f"{company_name} breach OR hack OR data"
+
+        for submission in REDDIT_CLIENT.subreddit("all").search(
+            search_query,
+            sort="relevance",
+            time_filter="all",
+            limit=limit
+        ):
+            articles.append({
+                "source": "reddit",
+                "title": submission.title,
+                "url": f"https://reddit.com{submission.permalink}",
+                "published_date": datetime.fromtimestamp(
+                    submission.created_utc
+                ).strftime("%Y-%m-%d"),
+                "subreddit": submission.subreddit.display_name,
+                "score": submission.score,
+                "num_comments": submission.num_comments,
+            })
+
+        time.sleep(0.5)  # Rate limiting
     except Exception as e:
         pass  # Fail silently for Reddit
 
@@ -553,7 +560,7 @@ def fetch_news_for_companies(companies: list) -> pd.DataFrame:
 
     # Check API key status
     print(f"\nAPI Status:")
-    print(f"  - Reddit: Limited (requires OAuth for full access)")
+    print(f"  - Reddit: {'Available (PRAW)' if REDDIT_CLIENT else 'MISSING (set REDDIT_CLIENT_ID & REDDIT_CLIENT_SECRET)'}")
     print(f"  - Guardian: {'Available' if GUARDIAN_API_KEY else 'MISSING KEY (set GUARDIAN_API_KEY)'}")
     print(f"  - NYT: {'Available' if NYT_API_KEY else 'MISSING KEY (set NYT_API_KEY)'}")
     print(f"  - NewsAPI: {'Available' if NEWSAPI_KEY else 'MISSING KEY (set NEWSAPI_KEY)'}")
