@@ -130,20 +130,179 @@ if __name__ == "__main__":
 # Source: Data_Breach_Enriched_Final.csv
 # Records: 1,772 data breach incidents
 #
-# Column                  | Type     | Description
-# ------------------------|----------|---------------------------------------------
-# org_name                | string   | Name of the organization that experienced the breach
-# reported_date           | datetime | Date the breach was reported to authorities
-# breach_date             | datetime | Date the breach occurred or was first detected
-# end_breach_date         | datetime | Date the breach ended (if applicable)
-# incident_details        | string   | Narrative description of the breach incident
-# information_affected    | JSON     | Structured data on types of information compromised
-#                         |          | (encryption status, categories affected, examples)
-# organization_type       | string   | Type/category of organization (e.g., BSF, BSO)
-# total_affected          | integer  | Number of individuals affected by the breach
-# breach_type             | string   | Type of breach (e.g., HACK, PHYS, INSD)
-# stock_ticker            | string   | Stock ticker symbol (if publicly traded)
-# cik                     | integer  | SEC Central Index Key identifier
-# sic                     | integer  | Standard Industrial Classification code
-# naics                   | integer  | North American Industry Classification System code
+# This dictionary is used for ETL operations, database schema creation,
+# and data retrieval throughout the pipeline.
 # =============================================================================
+
+DATA_DICTIONARY = {
+    "breach_data": {
+        "source": "Data_Breach_Enriched_Final.csv",
+        "table_name": "breach_incidents",
+        "description": "Data breach incidents affecting organizations",
+        "columns": {
+            "org_name": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(500)",
+                "pandas_dtype": "object",
+                "nullable": False,
+                "description": "Name of the organization that experienced the breach",
+            },
+            "reported_date": {
+                "python_type": "datetime",
+                "sql_type": "DATE",
+                "pandas_dtype": "datetime64[ns]",
+                "nullable": True,
+                "description": "Date the breach was reported to authorities",
+            },
+            "breach_date": {
+                "python_type": "datetime",
+                "sql_type": "DATE",
+                "pandas_dtype": "datetime64[ns]",
+                "nullable": True,
+                "description": "Date the breach occurred or was first detected",
+            },
+            "end_breach_date": {
+                "python_type": "datetime",
+                "sql_type": "DATE",
+                "pandas_dtype": "datetime64[ns]",
+                "nullable": True,
+                "description": "Date the breach ended (if applicable)",
+            },
+            "incident_details": {
+                "python_type": "str",
+                "sql_type": "TEXT",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Narrative description of the breach incident",
+            },
+            "information_affected": {
+                "python_type": "str",
+                "sql_type": "JSON",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Structured data on types of information compromised (encryption status, categories affected, examples)",
+            },
+            "organization_type": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(50)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Type/category of organization (e.g., BSF, BSO)",
+            },
+            "total_affected": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of individuals affected by the breach",
+            },
+            "breach_type": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(50)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Type of breach (e.g., HACK, PHYS, INSD)",
+            },
+            "stock_ticker": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(20)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Stock ticker symbol (if publicly traded)",
+            },
+            "cik": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "SEC Central Index Key identifier",
+            },
+            "sic": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Standard Industrial Classification code",
+            },
+            "naics": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "North American Industry Classification System code",
+            },
+        },
+    }
+}
+
+
+def get_schema(dataset_key: str = "breach_data") -> dict:
+    """Get the schema definition for a dataset."""
+    return DATA_DICTIONARY.get(dataset_key, {})
+
+
+def get_column_names(dataset_key: str = "breach_data") -> list:
+    """Get list of column names for a dataset."""
+    schema = get_schema(dataset_key)
+    return list(schema.get("columns", {}).keys())
+
+
+def get_sql_types(dataset_key: str = "breach_data") -> dict:
+    """Get SQL type mapping for database schema creation."""
+    schema = get_schema(dataset_key)
+    return {
+        col: info["sql_type"]
+        for col, info in schema.get("columns", {}).items()
+    }
+
+
+def get_pandas_dtypes(dataset_key: str = "breach_data") -> dict:
+    """Get pandas dtype mapping for data loading."""
+    schema = get_schema(dataset_key)
+    return {
+        col: info["pandas_dtype"]
+        for col, info in schema.get("columns", {}).items()
+    }
+
+
+def generate_create_table_sql(dataset_key: str = "breach_data", dialect: str = "sqlite") -> str:
+    """Generate CREATE TABLE SQL statement from the data dictionary."""
+    schema = get_schema(dataset_key)
+    table_name = schema.get("table_name", "data")
+    columns = schema.get("columns", {})
+
+    col_definitions = []
+    for col_name, col_info in columns.items():
+        sql_type = col_info["sql_type"]
+        nullable = "NULL" if col_info["nullable"] else "NOT NULL"
+        col_definitions.append(f"    {col_name} {sql_type} {nullable}")
+
+    # Add primary key
+    col_definitions.insert(0, "    id INTEGER PRIMARY KEY AUTOINCREMENT")
+
+    sql = f"CREATE TABLE IF NOT EXISTS {table_name} (\n"
+    sql += ",\n".join(col_definitions)
+    sql += "\n);"
+
+    return sql
+
+
+def apply_schema_dtypes(df: pd.DataFrame, dataset_key: str = "breach_data") -> pd.DataFrame:
+    """Apply data dictionary dtypes to a DataFrame."""
+    schema = get_schema(dataset_key)
+    columns = schema.get("columns", {})
+
+    for col_name, col_info in columns.items():
+        if col_name not in df.columns:
+            continue
+
+        pandas_dtype = col_info["pandas_dtype"]
+
+        if pandas_dtype == "datetime64[ns]":
+            df[col_name] = pd.to_datetime(df[col_name], errors='coerce')
+        elif pandas_dtype == "Int64":
+            df[col_name] = pd.to_numeric(df[col_name], errors='coerce').astype("Int64")
+        elif pandas_dtype == "object":
+            df[col_name] = df[col_name].astype(str).replace('nan', np.nan)
+
+    return df
