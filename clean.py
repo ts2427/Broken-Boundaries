@@ -122,3 +122,28 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+# =============================================================================
+# DATA DICTIONARY
+# =============================================================================
+# Source: Data_Breach_Enriched_Final.csv
+# Records: 1,772 data breach incidents
+#
+# Column                  | Type     | Description
+# ------------------------|----------|---------------------------------------------
+# org_name                | string   | Name of the organization that experienced the breach
+# reported_date           | datetime | Date the breach was reported to authorities
+# breach_date             | datetime | Date the breach occurred or was first detected
+# end_breach_date         | datetime | Date the breach ended (if applicable)
+# incident_details        | string   | Narrative description of the breach incident
+# information_affected    | JSON     | Structured data on types of information compromised
+#                         |          | (encryption status, categories affected, examples)
+# organization_type       | string   | Type/category of organization (e.g., BSF, BSO)
+# total_affected          | integer  | Number of individuals affected by the breach
+# breach_type             | string   | Type of breach (e.g., HACK, PHYS, INSD)
+# stock_ticker            | string   | Stock ticker symbol (if publicly traded)
+# cik                     | integer  | SEC Central Index Key identifier
+# sic                     | integer  | Standard Industrial Classification code
+# naics                   | integer  | North American Industry Classification System code
+# =============================================================================
