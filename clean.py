@@ -108,6 +108,49 @@ def save_cleaned_data(df: pd.DataFrame, filename: str = "breach_data_cleaned.csv
 # STOCK DATA ENRICHMENT (Yahoo Finance)
 # =============================================================================
 
+# Ticker mapping for companies that changed their ticker symbols
+# Format: old_ticker -> new_ticker
+TICKER_MAPPING = {
+    "SQ": "XYZ",       # Block Inc changed ticker in 2023
+    "FI": "FISV",      # Fiserv correct ticker
+    "DISH": "SATS",    # Dish merged with EchoStar
+    "FB": "META",      # Facebook -> Meta
+}
+
+# Tickers that are delisted/acquired (no longer tradeable)
+# These will be skipped with a note
+DELISTED_TICKERS = {
+    "ATVI": "Acquired by Microsoft (2023)",
+    "TWTR": "Acquired by X Corp (2022)",
+    "VMW": "Acquired by Broadcom (2023)",
+    "YHOO": "Acquired by Verizon (2017)",
+    "CTXS": "Taken private by Vista/Evergreen (2022)",
+    "CONE": "Acquired by KKR (2022)",
+    "PARA": "Merged with Skydance (2024)",
+    "WBA": "Taken private (2024)",
+    "ATUS": "Delisted (2024)",
+    "AUDAQ": "Bankruptcy, delisted (2024)",
+    "MCCC": "Taken private",
+}
+
+
+def get_current_ticker(ticker: str) -> tuple[str, str]:
+    """
+    Get the current trading ticker for a given ticker symbol.
+    Returns (current_ticker, note) where note explains any mapping.
+    """
+    ticker = ticker.upper().strip()
+
+    if ticker in DELISTED_TICKERS:
+        return None, DELISTED_TICKERS[ticker]
+
+    if ticker in TICKER_MAPPING:
+        new_ticker = TICKER_MAPPING[ticker]
+        return new_ticker, f"Mapped from {ticker}"
+
+    return ticker, None
+
+
 def fetch_stock_info(ticker: str) -> Optional[dict]:
     """Fetch stock information from Yahoo Finance for a single ticker."""
     try:
@@ -158,16 +201,33 @@ def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
     stock_data = []
     matched = 0
     not_found = 0
+    delisted = 0
+    mapped = 0
 
     for i, ticker in enumerate(tickers):
         if pd.isna(ticker) or ticker == 'nan' or ticker == '':
             continue
 
-        ticker = str(ticker).strip().upper()
-        print(f"  [{i+1}/{len(tickers)}] Fetching {ticker}...", end=" ")
+        original_ticker = str(ticker).strip().upper()
+        current_ticker, note = get_current_ticker(original_ticker)
 
-        info = fetch_stock_info(ticker)
+        # Handle delisted tickers
+        if current_ticker is None:
+            print(f"  [{i+1}/{len(tickers)}] {original_ticker}... DELISTED ({note})")
+            delisted += 1
+            continue
+
+        # Show mapping if applicable
+        if note and "Mapped" in note:
+            print(f"  [{i+1}/{len(tickers)}] {original_ticker} -> {current_ticker}...", end=" ")
+            mapped += 1
+        else:
+            print(f"  [{i+1}/{len(tickers)}] Fetching {current_ticker}...", end=" ")
+
+        info = fetch_stock_info(current_ticker)
         if info:
+            # Store original ticker for merging back to breach data
+            info['_original_ticker'] = original_ticker
             stock_data.append(info)
             matched += 1
             print("OK")
@@ -177,6 +237,8 @@ def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
 
     print(f"\nStock data summary:")
     print(f"  - Matched: {matched}")
+    print(f"  - Mapped to new ticker: {mapped}")
+    print(f"  - Delisted/Acquired: {delisted}")
     print(f"  - Not found: {not_found}")
 
     if stock_data:
@@ -201,14 +263,15 @@ def enrich_with_stock_data(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     # Merge stock data with breach data on ticker
+    # Use _original_ticker for merging (handles mapped tickers)
     df['stock_ticker_upper'] = df['stock_ticker'].str.upper().str.strip()
     df = df.merge(
         stock_df,
         left_on='stock_ticker_upper',
-        right_on='yf_ticker',
+        right_on='_original_ticker',
         how='left'
     )
-    df = df.drop(columns=['stock_ticker_upper'])
+    df = df.drop(columns=['stock_ticker_upper', '_original_ticker'])
 
     # Count enriched records
     enriched_count = df['yf_ticker'].notna().sum()
