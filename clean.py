@@ -6,7 +6,9 @@ Pulls in raw data sources and performs cleaning operations.
 
 import pandas as pd
 import numpy as np
+import yfinance as yf
 from pathlib import Path
+from typing import Optional
 
 
 # === Configuration ===
@@ -102,6 +104,119 @@ def save_cleaned_data(df: pd.DataFrame, filename: str = "breach_data_cleaned.csv
     print(f"Saved cleaned data to {output_path}")
 
 
+# =============================================================================
+# STOCK DATA ENRICHMENT (Yahoo Finance)
+# =============================================================================
+
+def fetch_stock_info(ticker: str) -> Optional[dict]:
+    """Fetch stock information from Yahoo Finance for a single ticker."""
+    try:
+        stock = yf.Ticker(ticker)
+        info = stock.info
+
+        # Check if we got valid data (Yahoo Finance returns empty dict for invalid tickers)
+        if not info or info.get('regularMarketPrice') is None:
+            return None
+
+        return {
+            'yf_ticker': ticker,
+            'yf_company_name': info.get('longName') or info.get('shortName'),
+            'yf_sector': info.get('sector'),
+            'yf_industry': info.get('industry'),
+            'yf_market_cap': info.get('marketCap'),
+            'yf_enterprise_value': info.get('enterpriseValue'),
+            'yf_employees': info.get('fullTimeEmployees'),
+            'yf_country': info.get('country'),
+            'yf_website': info.get('website'),
+            'yf_exchange': info.get('exchange'),
+            'yf_currency': info.get('currency'),
+            'yf_current_price': info.get('regularMarketPrice'),
+            'yf_52week_high': info.get('fiftyTwoWeekHigh'),
+            'yf_52week_low': info.get('fiftyTwoWeekLow'),
+            'yf_avg_volume': info.get('averageVolume'),
+            'yf_dividend_yield': info.get('dividendYield'),
+            'yf_beta': info.get('beta'),
+            'yf_pe_ratio': info.get('trailingPE'),
+            'yf_forward_pe': info.get('forwardPE'),
+            'yf_profit_margin': info.get('profitMargins'),
+            'yf_revenue': info.get('totalRevenue'),
+            'yf_gross_profit': info.get('grossProfits'),
+            'yf_ebitda': info.get('ebitda'),
+            'yf_total_debt': info.get('totalDebt'),
+            'yf_total_cash': info.get('totalCash'),
+        }
+    except Exception as e:
+        print(f"  Warning: Could not fetch data for {ticker}: {e}")
+        return None
+
+
+def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
+    """Fetch stock data for all unique tickers."""
+    print(f"\n=== Fetching Stock Data from Yahoo Finance ===\n")
+    print(f"Unique tickers to fetch: {len(tickers)}")
+
+    stock_data = []
+    matched = 0
+    not_found = 0
+
+    for i, ticker in enumerate(tickers):
+        if pd.isna(ticker) or ticker == 'nan' or ticker == '':
+            continue
+
+        ticker = str(ticker).strip().upper()
+        print(f"  [{i+1}/{len(tickers)}] Fetching {ticker}...", end=" ")
+
+        info = fetch_stock_info(ticker)
+        if info:
+            stock_data.append(info)
+            matched += 1
+            print("OK")
+        else:
+            not_found += 1
+            print("Not found")
+
+    print(f"\nStock data summary:")
+    print(f"  - Matched: {matched}")
+    print(f"  - Not found: {not_found}")
+
+    if stock_data:
+        return pd.DataFrame(stock_data)
+    return pd.DataFrame()
+
+
+def enrich_with_stock_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with stock information from Yahoo Finance."""
+    # Get unique tickers
+    tickers = df['stock_ticker'].dropna().unique().tolist()
+
+    if not tickers:
+        print("No tickers found in data, skipping stock enrichment")
+        return df
+
+    # Fetch stock data
+    stock_df = fetch_all_stock_data(tickers)
+
+    if stock_df.empty:
+        print("No stock data retrieved, skipping enrichment")
+        return df
+
+    # Merge stock data with breach data on ticker
+    df['stock_ticker_upper'] = df['stock_ticker'].str.upper().str.strip()
+    df = df.merge(
+        stock_df,
+        left_on='stock_ticker_upper',
+        right_on='yf_ticker',
+        how='left'
+    )
+    df = df.drop(columns=['stock_ticker_upper'])
+
+    # Count enriched records
+    enriched_count = df['yf_ticker'].notna().sum()
+    print(f"\nEnriched {enriched_count} records with stock data")
+
+    return df
+
+
 def main():
     """Main entry point for the cleaning pipeline."""
     # Load raw data source
@@ -114,10 +229,13 @@ def main():
     # Run cleaning pipeline
     df_cleaned = clean_pipeline(df)
 
-    # Save cleaned data
-    save_cleaned_data(df_cleaned)
+    # Enrich with stock data from Yahoo Finance
+    df_enriched = enrich_with_stock_data(df_cleaned)
 
-    return df_cleaned
+    # Save enriched data
+    save_cleaned_data(df_enriched, "breach_data_enriched.csv")
+
+    return df_enriched
 
 
 if __name__ == "__main__":
@@ -230,6 +348,182 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "Int64",
                 "nullable": True,
                 "description": "North American Industry Classification System code",
+            },
+            # --- Yahoo Finance Stock Data (yf_ prefix) ---
+            "yf_ticker": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(20)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Verified ticker symbol from Yahoo Finance",
+            },
+            "yf_company_name": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(500)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Official company name from Yahoo Finance",
+            },
+            "yf_sector": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(100)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Business sector (e.g., Technology, Healthcare)",
+            },
+            "yf_industry": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(200)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Specific industry classification",
+            },
+            "yf_market_cap": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Market capitalization in USD",
+            },
+            "yf_enterprise_value": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Enterprise value in USD",
+            },
+            "yf_employees": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of full-time employees",
+            },
+            "yf_country": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(100)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Country of headquarters",
+            },
+            "yf_website": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(500)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Company website URL",
+            },
+            "yf_exchange": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(50)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Stock exchange (e.g., NMS, NYQ)",
+            },
+            "yf_currency": {
+                "python_type": "str",
+                "sql_type": "VARCHAR(10)",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "Trading currency",
+            },
+            "yf_current_price": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(12,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Current stock price",
+            },
+            "yf_52week_high": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(12,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "52-week high price",
+            },
+            "yf_52week_low": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(12,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "52-week low price",
+            },
+            "yf_avg_volume": {
+                "python_type": "int",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Average daily trading volume",
+            },
+            "yf_dividend_yield": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,6)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Dividend yield as decimal",
+            },
+            "yf_beta": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Beta coefficient (volatility measure)",
+            },
+            "yf_pe_ratio": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(12,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Trailing price-to-earnings ratio",
+            },
+            "yf_forward_pe": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(12,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Forward price-to-earnings ratio",
+            },
+            "yf_profit_margin": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,6)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Profit margin as decimal",
+            },
+            "yf_revenue": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Total revenue in USD",
+            },
+            "yf_gross_profit": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Gross profit in USD",
+            },
+            "yf_ebitda": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "EBITDA in USD",
+            },
+            "yf_total_debt": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Total debt in USD",
+            },
+            "yf_total_cash": {
+                "python_type": "float",
+                "sql_type": "BIGINT",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Total cash and equivalents in USD",
             },
         },
     }
