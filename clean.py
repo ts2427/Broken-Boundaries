@@ -7,8 +7,17 @@ Pulls in raw data sources and performs cleaning operations.
 import pandas as pd
 import numpy as np
 import yfinance as yf
+import requests
+import time
+import os
+import json
 from pathlib import Path
 from typing import Optional
+from datetime import datetime
+from dotenv import load_dotenv
+
+# Load environment variables for API keys
+load_dotenv()
 
 
 # === Configuration ===
@@ -323,6 +332,313 @@ def add_ticker_status(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# =============================================================================
+# NEWS DATA ENRICHMENT (Reddit, The Guardian, New York Times)
+# =============================================================================
+# Fetches news articles about breached companies from 2005-2025
+# Requires API keys set in .env file:
+#   - GUARDIAN_API_KEY: The Guardian Open Platform API key
+#   - NYT_API_KEY: New York Times Article Search API key
+# Reddit uses public JSON endpoints (no key required)
+# =============================================================================
+
+# API Configuration
+GUARDIAN_API_KEY = os.getenv("GUARDIAN_API_KEY", "")
+NYT_API_KEY = os.getenv("NYT_API_KEY", "")
+NEWSAPI_KEY = os.getenv("NEWSAPI_KEY", "")  # Alternative: newsapi.org
+NEWS_START_DATE = "2005-01-01"
+NEWS_END_DATE = "2025-12-31"
+
+
+def fetch_reddit_news(company_name: str, limit: int = 10) -> list:
+    """
+    Fetch news posts from Reddit about a company.
+    Note: Reddit now requires OAuth for API access. This function attempts
+    the public endpoint but may return empty results due to rate limiting.
+    For production use, consider using PRAW with Reddit API credentials.
+    """
+    articles = []
+    try:
+        # Search in news and business subreddits
+        search_query = f"{company_name} breach OR hack OR data"
+        url = "https://www.reddit.com/search.json"
+        params = {
+            "q": search_query,
+            "sort": "relevance",
+            "limit": limit,
+            "restrict_sr": False,
+            "t": "all"  # All time
+        }
+        headers = {
+            "User-Agent": "BrokenBoundaries/1.0 (academic research; contact@example.com)"
+        }
+
+        response = requests.get(url, params=params, headers=headers, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            for post in data.get("data", {}).get("children", []):
+                post_data = post.get("data", {})
+                articles.append({
+                    "source": "reddit",
+                    "title": post_data.get("title", ""),
+                    "url": f"https://reddit.com{post_data.get('permalink', '')}",
+                    "published_date": datetime.fromtimestamp(
+                        post_data.get("created_utc", 0)
+                    ).strftime("%Y-%m-%d") if post_data.get("created_utc") else None,
+                    "subreddit": post_data.get("subreddit", ""),
+                    "score": post_data.get("score", 0),
+                    "num_comments": post_data.get("num_comments", 0),
+                })
+        elif response.status_code == 403:
+            pass  # Reddit API requires auth, skip silently
+        time.sleep(1)  # Rate limiting
+    except Exception as e:
+        pass  # Fail silently for Reddit
+
+    return articles
+
+
+def fetch_newsapi_news(company_name: str, limit: int = 10) -> list:
+    """
+    Fetch news articles from NewsAPI.org about a company.
+    Requires NEWSAPI_KEY environment variable.
+    Free tier: https://newsapi.org/ (limited to 100 requests/day)
+    """
+    if not NEWSAPI_KEY:
+        return []
+
+    articles = []
+    try:
+        url = "https://newsapi.org/v2/everything"
+        params = {
+            "q": f'"{company_name}" AND (breach OR hack OR "data leak")',
+            "language": "en",
+            "sortBy": "relevance",
+            "pageSize": limit,
+            "apiKey": NEWSAPI_KEY,
+        }
+
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            for article in data.get("articles", []):
+                articles.append({
+                    "source": "newsapi",
+                    "title": article.get("title", ""),
+                    "url": article.get("url", ""),
+                    "published_date": article.get("publishedAt", "")[:10] if article.get("publishedAt") else None,
+                    "source_name": article.get("source", {}).get("name", ""),
+                    "author": article.get("author", ""),
+                    "description": article.get("description", ""),
+                })
+        time.sleep(0.5)  # Rate limiting
+    except Exception as e:
+        print(f"    NewsAPI error for {company_name}: {e}")
+
+    return articles
+
+
+def fetch_guardian_news(company_name: str, limit: int = 10) -> list:
+    """
+    Fetch news articles from The Guardian about a company.
+    Requires GUARDIAN_API_KEY environment variable.
+    Free API: https://open-platform.theguardian.com/
+    """
+    if not GUARDIAN_API_KEY:
+        return []
+
+    articles = []
+    try:
+        url = "https://content.guardianapis.com/search"
+        params = {
+            "q": f'"{company_name}" AND (breach OR hack OR "data leak" OR cybersecurity)',
+            "from-date": NEWS_START_DATE,
+            "to-date": NEWS_END_DATE,
+            "page-size": limit,
+            "order-by": "relevance",
+            "api-key": GUARDIAN_API_KEY,
+            "show-fields": "headline,trailText,byline,publication"
+        }
+
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            for item in data.get("response", {}).get("results", []):
+                fields = item.get("fields", {})
+                articles.append({
+                    "source": "guardian",
+                    "title": item.get("webTitle", ""),
+                    "url": item.get("webUrl", ""),
+                    "published_date": item.get("webPublicationDate", "")[:10] if item.get("webPublicationDate") else None,
+                    "section": item.get("sectionName", ""),
+                    "byline": fields.get("byline", ""),
+                    "trail_text": fields.get("trailText", ""),
+                })
+        time.sleep(0.5)  # Rate limiting
+    except Exception as e:
+        print(f"    Guardian error for {company_name}: {e}")
+
+    return articles
+
+
+def fetch_nyt_news(company_name: str, limit: int = 10) -> list:
+    """
+    Fetch news articles from New York Times about a company.
+    Requires NYT_API_KEY environment variable.
+    API: https://developer.nytimes.com/
+    """
+    if not NYT_API_KEY:
+        return []
+
+    articles = []
+    try:
+        url = "https://api.nytimes.com/svc/search/v2/articlesearch.json"
+        params = {
+            "q": f'{company_name} breach hack cybersecurity',
+            "begin_date": NEWS_START_DATE.replace("-", ""),
+            "end_date": NEWS_END_DATE.replace("-", ""),
+            "sort": "relevance",
+            "api-key": NYT_API_KEY,
+        }
+
+        response = requests.get(url, params=params, timeout=10)
+        if response.status_code == 200:
+            data = response.json()
+            for doc in data.get("response", {}).get("docs", [])[:limit]:
+                articles.append({
+                    "source": "nyt",
+                    "title": doc.get("headline", {}).get("main", ""),
+                    "url": doc.get("web_url", ""),
+                    "published_date": doc.get("pub_date", "")[:10] if doc.get("pub_date") else None,
+                    "section": doc.get("section_name", ""),
+                    "byline": doc.get("byline", {}).get("original", ""),
+                    "lead_paragraph": doc.get("lead_paragraph", ""),
+                    "word_count": doc.get("word_count", 0),
+                })
+        time.sleep(1)  # Rate limiting (NYT has stricter limits)
+    except Exception as e:
+        print(f"    NYT error for {company_name}: {e}")
+
+    return articles
+
+
+def fetch_all_news_for_company(company_name: str, ticker: str = None) -> dict:
+    """Fetch news from all sources for a single company."""
+    # Use company name for search
+    search_term = company_name
+
+    reddit_articles = fetch_reddit_news(search_term)
+    guardian_articles = fetch_guardian_news(search_term)
+    nyt_articles = fetch_nyt_news(search_term)
+    newsapi_articles = fetch_newsapi_news(search_term)
+
+    return {
+        "reddit_articles": reddit_articles,
+        "guardian_articles": guardian_articles,
+        "nyt_articles": nyt_articles,
+        "newsapi_articles": newsapi_articles,
+        "reddit_count": len(reddit_articles),
+        "guardian_count": len(guardian_articles),
+        "nyt_count": len(nyt_articles),
+        "newsapi_count": len(newsapi_articles),
+        "total_news_count": len(reddit_articles) + len(guardian_articles) + len(nyt_articles) + len(newsapi_articles),
+    }
+
+
+def fetch_news_for_companies(companies: list) -> pd.DataFrame:
+    """Fetch news data for all unique companies."""
+    print(f"\n=== Fetching News Data (Reddit, Guardian, NYT) ===\n")
+    print(f"Unique companies to search: {len(companies)}")
+    print(f"Date range: {NEWS_START_DATE} to {NEWS_END_DATE}")
+
+    # Check API key status
+    print(f"\nAPI Status:")
+    print(f"  - Reddit: Limited (requires OAuth for full access)")
+    print(f"  - Guardian: {'Available' if GUARDIAN_API_KEY else 'MISSING KEY (set GUARDIAN_API_KEY)'}")
+    print(f"  - NYT: {'Available' if NYT_API_KEY else 'MISSING KEY (set NYT_API_KEY)'}")
+    print(f"  - NewsAPI: {'Available' if NEWSAPI_KEY else 'MISSING KEY (set NEWSAPI_KEY)'}")
+    print()
+
+    news_data = []
+
+    for i, company in enumerate(companies):
+        company_name = company.get("name", "")
+        ticker = company.get("ticker", "")
+
+        if not company_name or company_name == 'nan':
+            continue
+
+        print(f"  [{i+1}/{len(companies)}] {company_name[:40]}...", end=" ")
+
+        news = fetch_all_news_for_company(company_name, ticker)
+        news["company_name"] = company_name
+        news["stock_ticker"] = ticker
+
+        # Convert article lists to JSON strings for storage
+        news["reddit_articles_json"] = json.dumps(news["reddit_articles"]) if news["reddit_articles"] else None
+        news["guardian_articles_json"] = json.dumps(news["guardian_articles"]) if news["guardian_articles"] else None
+        news["nyt_articles_json"] = json.dumps(news["nyt_articles"]) if news["nyt_articles"] else None
+        news["newsapi_articles_json"] = json.dumps(news["newsapi_articles"]) if news["newsapi_articles"] else None
+
+        # Remove the list versions (keep JSON)
+        del news["reddit_articles"]
+        del news["guardian_articles"]
+        del news["nyt_articles"]
+        del news["newsapi_articles"]
+
+        news_data.append(news)
+        print(f"R:{news['reddit_count']} G:{news['guardian_count']} N:{news['nyt_count']} A:{news['newsapi_count']}")
+
+    print(f"\nNews fetch complete.")
+
+    if news_data:
+        return pd.DataFrame(news_data)
+    return pd.DataFrame()
+
+
+def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with news articles from multiple sources."""
+    # Get unique company/ticker combinations
+    companies = df[['org_name', 'stock_ticker']].drop_duplicates()
+    company_list = [
+        {"name": row['org_name'], "ticker": row['stock_ticker']}
+        for _, row in companies.iterrows()
+    ]
+
+    if not company_list:
+        print("No companies found, skipping news enrichment")
+        return df
+
+    # Fetch news data
+    news_df = fetch_news_for_companies(company_list)
+
+    if news_df.empty:
+        print("No news data retrieved, skipping enrichment")
+        return df
+
+    # Merge news data with breach data on company name
+    df = df.merge(
+        news_df,
+        left_on='org_name',
+        right_on='company_name',
+        how='left'
+    )
+
+    # Clean up duplicate columns
+    if 'company_name' in df.columns:
+        df = df.drop(columns=['company_name'])
+    if 'stock_ticker_y' in df.columns:
+        df = df.drop(columns=['stock_ticker_y'])
+        df = df.rename(columns={'stock_ticker_x': 'stock_ticker'})
+
+    # Count enriched records
+    enriched_count = df['total_news_count'].notna().sum()
+    total_articles = df['total_news_count'].sum()
+    print(f"\nEnriched {enriched_count} records with news data ({int(total_articles)} total articles)")
+
+    return df
+
+
 def main():
     """Main entry point for the cleaning pipeline."""
     # Load raw data source
@@ -338,10 +654,13 @@ def main():
     # Enrich with stock data from Yahoo Finance
     df_enriched = enrich_with_stock_data(df_cleaned)
 
-    # Save enriched data
-    save_cleaned_data(df_enriched, "breach_data_enriched.csv")
+    # Enrich with news data from Reddit, Guardian, NYT
+    df_with_news = enrich_with_news_data(df_enriched)
 
-    return df_enriched
+    # Save enriched data
+    save_cleaned_data(df_with_news, "breach_data_enriched.csv")
+
+    return df_with_news
 
 
 if __name__ == "__main__":
@@ -645,6 +964,70 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "object",
                 "nullable": True,
                 "description": "Details about ticker status (e.g., 'Acquired by Microsoft (2023)', 'SQ -> XYZ')",
+            },
+            # --- News Data (Reddit, Guardian, NYT, NewsAPI) ---
+            "reddit_count": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of Reddit posts found about the company breach",
+            },
+            "guardian_count": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of Guardian articles found about the company breach",
+            },
+            "nyt_count": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of New York Times articles found about the company breach",
+            },
+            "newsapi_count": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Number of NewsAPI articles found about the company breach",
+            },
+            "total_news_count": {
+                "python_type": "int",
+                "sql_type": "INTEGER",
+                "pandas_dtype": "Int64",
+                "nullable": True,
+                "description": "Total news articles/posts found across all sources",
+            },
+            "reddit_articles_json": {
+                "python_type": "str",
+                "sql_type": "JSON",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "JSON array of Reddit posts (title, url, date, subreddit, score, comments)",
+            },
+            "guardian_articles_json": {
+                "python_type": "str",
+                "sql_type": "JSON",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "JSON array of Guardian articles (title, url, date, section, byline)",
+            },
+            "nyt_articles_json": {
+                "python_type": "str",
+                "sql_type": "JSON",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "JSON array of NYT articles (title, url, date, section, byline, word_count)",
+            },
+            "newsapi_articles_json": {
+                "python_type": "str",
+                "sql_type": "JSON",
+                "pandas_dtype": "object",
+                "nullable": True,
+                "description": "JSON array of NewsAPI articles (title, url, date, source, author, description)",
             },
         },
     }
