@@ -646,6 +646,181 @@ def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# =============================================================================
+# VOLATILITY INDEX (VIX) FROM FEDERAL RESERVE
+# =============================================================================
+# Fetches the CBOE Volatility Index (VIX) from FRED (Federal Reserve Economic Data)
+# VIX measures expected market volatility over the next 30 days
+# Series: VIXCLS (CBOE Volatility Index: VIX)
+# Date range: January 1, 2005 - December 31, 2025
+# =============================================================================
+
+VIX_START_DATE = "2005-01-01"
+VIX_END_DATE = "2025-12-31"
+
+
+def fetch_vix_data() -> pd.DataFrame:
+    """
+    Fetch VIX (Volatility Index) data from FRED.
+    Returns daily VIX values from 2005-2025.
+    Uses FRED's public API endpoint (no API key required for basic access).
+    """
+    print(f"\n=== Fetching VIX Data from Federal Reserve (FRED) ===\n")
+    print(f"Date range: {VIX_START_DATE} to {VIX_END_DATE}")
+
+    try:
+        # Use FRED's public CSV download endpoint
+        print("Fetching VIX data from FRED...")
+        url = (
+            f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+            f"?id=VIXCLS"
+            f"&cosd={VIX_START_DATE}"
+            f"&coed={VIX_END_DATE}"
+        )
+
+        vix_df = pd.read_csv(url)
+        vix_df.columns = ['date', 'vix_close']
+
+        # Clean the data
+        vix_df['date'] = pd.to_datetime(vix_df['date'])
+        vix_df['vix_close'] = pd.to_numeric(vix_df['vix_close'], errors='coerce')
+
+        # Remove any rows with missing VIX values (FRED uses '.' for missing)
+        vix_df = vix_df.dropna(subset=['vix_close'])
+
+        print(f"Retrieved {len(vix_df)} daily VIX observations")
+        print(f"Date range: {vix_df['date'].min().strftime('%Y-%m-%d')} to {vix_df['date'].max().strftime('%Y-%m-%d')}")
+        print(f"VIX range: {vix_df['vix_close'].min():.2f} to {vix_df['vix_close'].max():.2f}")
+        print(f"VIX mean: {vix_df['vix_close'].mean():.2f}")
+
+        return vix_df
+
+    except Exception as e:
+        print(f"Error fetching VIX data: {e}")
+        return pd.DataFrame()
+
+
+def calculate_vix_metrics(vix_df: pd.DataFrame, breach_date: pd.Timestamp) -> dict:
+    """
+    Calculate VIX metrics around a breach date.
+    Returns VIX values at breach date and surrounding periods.
+    """
+    if vix_df.empty or pd.isna(breach_date):
+        return {
+            'vix_at_breach': None,
+            'vix_7d_before': None,
+            'vix_30d_before': None,
+            'vix_7d_after': None,
+            'vix_30d_after': None,
+            'vix_30d_avg': None,
+            'vix_90d_avg': None,
+        }
+
+    # Convert breach_date to datetime if needed
+    if isinstance(breach_date, str):
+        breach_date = pd.to_datetime(breach_date)
+
+    # Find closest VIX value to breach date
+    vix_df_sorted = vix_df.copy()
+    vix_df_sorted['date'] = pd.to_datetime(vix_df_sorted['date'])
+
+    # VIX at breach date (or closest available)
+    closest_idx = (vix_df_sorted['date'] - breach_date).abs().idxmin()
+    vix_at_breach = vix_df_sorted.loc[closest_idx, 'vix_close']
+
+    # VIX 7 days before
+    date_7d_before = breach_date - pd.Timedelta(days=7)
+    mask_7d_before = vix_df_sorted['date'] <= date_7d_before
+    vix_7d_before = vix_df_sorted[mask_7d_before]['vix_close'].iloc[-1] if mask_7d_before.any() else None
+
+    # VIX 30 days before
+    date_30d_before = breach_date - pd.Timedelta(days=30)
+    mask_30d_before = vix_df_sorted['date'] <= date_30d_before
+    vix_30d_before = vix_df_sorted[mask_30d_before]['vix_close'].iloc[-1] if mask_30d_before.any() else None
+
+    # VIX 7 days after
+    date_7d_after = breach_date + pd.Timedelta(days=7)
+    mask_7d_after = vix_df_sorted['date'] >= date_7d_after
+    vix_7d_after = vix_df_sorted[mask_7d_after]['vix_close'].iloc[0] if mask_7d_after.any() else None
+
+    # VIX 30 days after
+    date_30d_after = breach_date + pd.Timedelta(days=30)
+    mask_30d_after = vix_df_sorted['date'] >= date_30d_after
+    vix_30d_after = vix_df_sorted[mask_30d_after]['vix_close'].iloc[0] if mask_30d_after.any() else None
+
+    # 30-day average around breach
+    mask_30d_window = (
+        (vix_df_sorted['date'] >= breach_date - pd.Timedelta(days=15)) &
+        (vix_df_sorted['date'] <= breach_date + pd.Timedelta(days=15))
+    )
+    vix_30d_avg = vix_df_sorted[mask_30d_window]['vix_close'].mean() if mask_30d_window.any() else None
+
+    # 90-day average around breach
+    mask_90d_window = (
+        (vix_df_sorted['date'] >= breach_date - pd.Timedelta(days=45)) &
+        (vix_df_sorted['date'] <= breach_date + pd.Timedelta(days=45))
+    )
+    vix_90d_avg = vix_df_sorted[mask_90d_window]['vix_close'].mean() if mask_90d_window.any() else None
+
+    return {
+        'vix_at_breach': round(vix_at_breach, 2) if vix_at_breach else None,
+        'vix_7d_before': round(vix_7d_before, 2) if vix_7d_before else None,
+        'vix_30d_before': round(vix_30d_before, 2) if vix_30d_before else None,
+        'vix_7d_after': round(vix_7d_after, 2) if vix_7d_after else None,
+        'vix_30d_after': round(vix_30d_after, 2) if vix_30d_after else None,
+        'vix_30d_avg': round(vix_30d_avg, 2) if vix_30d_avg else None,
+        'vix_90d_avg': round(vix_90d_avg, 2) if vix_90d_avg else None,
+    }
+
+
+def enrich_with_vix_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enrich breach data with VIX (Volatility Index) metrics.
+    Adds VIX values at breach date and surrounding periods.
+    """
+    # Fetch VIX data
+    vix_df = fetch_vix_data()
+
+    if vix_df.empty:
+        print("No VIX data available, skipping enrichment")
+        # Add empty columns
+        for col in ['vix_at_breach', 'vix_7d_before', 'vix_30d_before',
+                    'vix_7d_after', 'vix_30d_after', 'vix_30d_avg', 'vix_90d_avg']:
+            df[col] = None
+        return df
+
+    print(f"\nCalculating VIX metrics for {len(df)} breach records...")
+
+    # Calculate VIX metrics for each breach
+    vix_metrics_list = []
+    for idx, row in df.iterrows():
+        breach_date = row.get('breach_date')
+        metrics = calculate_vix_metrics(vix_df, breach_date)
+        vix_metrics_list.append(metrics)
+
+        if (idx + 1) % 200 == 0:
+            print(f"  Processed {idx + 1}/{len(df)} records")
+
+    # Convert to DataFrame and merge
+    vix_metrics_df = pd.DataFrame(vix_metrics_list)
+
+    # Add VIX columns to main dataframe
+    for col in vix_metrics_df.columns:
+        df[col] = vix_metrics_df[col].values
+
+    # Count enriched records
+    enriched_count = df['vix_at_breach'].notna().sum()
+    print(f"\nEnriched {enriched_count} records with VIX data")
+
+    # Print summary statistics
+    print(f"\nVIX Summary at Breach Dates:")
+    print(f"  Mean VIX: {df['vix_at_breach'].mean():.2f}")
+    print(f"  Min VIX: {df['vix_at_breach'].min():.2f}")
+    print(f"  Max VIX: {df['vix_at_breach'].max():.2f}")
+
+    return df
+
+
 def main():
     """Main entry point for the cleaning pipeline."""
     # Load raw data source
@@ -664,10 +839,13 @@ def main():
     # Enrich with news data from Reddit, Guardian, NYT
     df_with_news = enrich_with_news_data(df_enriched)
 
-    # Save enriched data
-    save_cleaned_data(df_with_news, "breach_data_enriched.csv")
+    # Enrich with VIX (Volatility Index) data from Federal Reserve
+    df_with_vix = enrich_with_vix_data(df_with_news)
 
-    return df_with_news
+    # Save enriched data
+    save_cleaned_data(df_with_vix, "breach_data_enriched.csv")
+
+    return df_with_vix
 
 
 if __name__ == "__main__":
@@ -1035,6 +1213,56 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "object",
                 "nullable": True,
                 "description": "JSON array of NewsAPI articles (title, url, date, source, author, description)",
+            },
+            # --- VIX (Volatility Index) Data from Federal Reserve ---
+            "vix_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "CBOE Volatility Index (VIX) at breach date",
+            },
+            "vix_7d_before": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "VIX value 7 days before breach",
+            },
+            "vix_30d_before": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "VIX value 30 days before breach",
+            },
+            "vix_7d_after": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "VIX value 7 days after breach",
+            },
+            "vix_30d_after": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "VIX value 30 days after breach",
+            },
+            "vix_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average VIX in 30-day window around breach (+/- 15 days)",
+            },
+            "vix_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average VIX in 90-day window around breach (+/- 45 days)",
             },
         },
     }

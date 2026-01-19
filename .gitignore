@@ -20,3 +20,4 @@ cleaned/
 # OS
 .DS_Store
 Thumbs.db
+logs/
