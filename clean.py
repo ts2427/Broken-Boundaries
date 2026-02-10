@@ -12,10 +12,13 @@ import praw
 import time
 import os
 import json
+import logging
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
 from dotenv import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 # Load environment variables for API keys
 load_dotenv()
@@ -33,7 +36,29 @@ if REDDIT_CLIENT_ID and REDDIT_CLIENT_SECRET:
             user_agent="BrokenBoundaries/1.0 (academic research)"
         )
     except Exception as e:
-        print(f"Warning: Could not initialize Reddit client: {e}")
+        logger.warning("Could not initialize Reddit client: %s", e)
+
+
+def _request_with_retry(url: str, params: dict = None, max_retries: int = 3, timeout: int = 10) -> Optional[requests.Response]:
+    """Make an HTTP GET request with exponential backoff on failure."""
+    for attempt in range(max_retries):
+        try:
+            response = requests.get(url, params=params, timeout=timeout)
+            if response.status_code == 429:  # Rate limited
+                wait = 2 ** (attempt + 1)
+                logger.warning("Rate limited on %s, retrying in %ds", url, wait)
+                time.sleep(wait)
+                continue
+            return response
+        except requests.RequestException as e:
+            if attempt < max_retries - 1:
+                wait = 2 ** attempt
+                logger.warning("Request to %s failed (%s), retry %d/%d in %ds",
+                              url, e, attempt + 1, max_retries, wait)
+                time.sleep(wait)
+            else:
+                logger.warning("Request to %s failed after %d retries: %s", url, max_retries, e)
+    return None
 
 
 # === Configuration ===
@@ -49,7 +74,7 @@ def load_breach_data(filepath: str = "Data_Breach_Enriched_Final.csv") -> pd.Dat
         df = pd.read_csv(data_path, encoding='utf-8')
     except UnicodeDecodeError:
         df = pd.read_csv(data_path, encoding='latin-1')
-    print(f"Loaded {len(df)} records from {filepath}")
+    logger.info("Loaded %d records from %s", len(df), filepath)
     return df
 
 
@@ -82,8 +107,7 @@ def clean_text_columns(df: pd.DataFrame) -> pd.DataFrame:
 
     for col in text_columns:
         if col in df.columns:
-            df[col] = df[col].astype(str).str.strip()
-            df[col] = df[col].replace('nan', np.nan)
+            df[col] = df[col].str.strip()
 
     return df
 
@@ -94,22 +118,22 @@ def remove_duplicates(df: pd.DataFrame) -> pd.DataFrame:
     df = df.drop_duplicates()
     removed = initial_count - len(df)
     if removed > 0:
-        print(f"Removed {removed} duplicate records")
+        logger.info("Removed %d duplicate records", removed)
     return df
 
 
 def summarize_data(df: pd.DataFrame) -> pd.DataFrame:
     """Print summary statistics for the cleaned data."""
-    print(f"Total records: {len(df)}")
-    print(f"  - With org_name: {df['org_name'].notna().sum()}")
-    print(f"  - With breach_date: {df['breach_date'].notna().sum()}")
-    print(f"  - With total_affected: {df['total_affected'].notna().sum()}")
+    logger.info("Total records: %d", len(df))
+    logger.info("  - With org_name: %d", df['org_name'].notna().sum())
+    logger.info("  - With breach_date: %d", df['breach_date'].notna().sum())
+    logger.info("  - With total_affected: %d", df['total_affected'].notna().sum())
     return df
 
 
 def clean_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     """Run the full cleaning pipeline."""
-    print("\n=== Starting Data Cleaning Pipeline ===\n")
+    logger.info("Starting Data Cleaning Pipeline")
 
     df = clean_dates(df)
     df = clean_numeric_columns(df)
@@ -117,7 +141,7 @@ def clean_pipeline(df: pd.DataFrame) -> pd.DataFrame:
     df = remove_duplicates(df)
     df = summarize_data(df)
 
-    print("\n=== Cleaning Complete ===\n")
+    logger.info("Cleaning Complete")
     return df
 
 
@@ -126,7 +150,7 @@ def save_cleaned_data(df: pd.DataFrame, filename: str = "breach_data_cleaned.csv
     OUTPUT_DIR.mkdir(exist_ok=True)
     output_path = OUTPUT_DIR / filename
     df.to_csv(output_path, index=False)
-    print(f"Saved cleaned data to {output_path}")
+    logger.info("Saved cleaned data to %s", output_path)
 
 
 # =============================================================================
@@ -214,14 +238,14 @@ def fetch_stock_info(ticker: str) -> Optional[dict]:
             'yf_total_cash': info.get('totalCash'),
         }
     except Exception as e:
-        print(f"  Warning: Could not fetch data for {ticker}: {e}")
+        logger.warning("Could not fetch data for %s: %s", ticker, e)
         return None
 
 
 def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
     """Fetch stock data for all unique tickers."""
-    print(f"\n=== Fetching Stock Data from Yahoo Finance ===\n")
-    print(f"Unique tickers to fetch: {len(tickers)}")
+    logger.info("Fetching Stock Data from Yahoo Finance")
+    logger.info("Unique tickers to fetch: %d", len(tickers))
 
     stock_data = []
     matched = 0
@@ -238,16 +262,13 @@ def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
 
         # Handle delisted tickers
         if current_ticker is None:
-            print(f"  [{i+1}/{len(tickers)}] {original_ticker}... DELISTED ({note})")
+            logger.info("  [%d/%d] %s... DELISTED (%s)", i+1, len(tickers), original_ticker, note)
             delisted += 1
             continue
 
         # Show mapping if applicable
         if note and "Mapped" in note:
-            print(f"  [{i+1}/{len(tickers)}] {original_ticker} -> {current_ticker}...", end=" ")
             mapped += 1
-        else:
-            print(f"  [{i+1}/{len(tickers)}] Fetching {current_ticker}...", end=" ")
 
         info = fetch_stock_info(current_ticker)
         if info:
@@ -255,16 +276,13 @@ def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
             info['_original_ticker'] = original_ticker
             stock_data.append(info)
             matched += 1
-            print("OK")
+            logger.info("  [%d/%d] %s... OK", i+1, len(tickers), current_ticker)
         else:
             not_found += 1
-            print("Not found")
+            logger.info("  [%d/%d] %s... Not found", i+1, len(tickers), current_ticker)
 
-    print(f"\nStock data summary:")
-    print(f"  - Matched: {matched}")
-    print(f"  - Mapped to new ticker: {mapped}")
-    print(f"  - Delisted/Acquired: {delisted}")
-    print(f"  - Not found: {not_found}")
+    logger.info("Stock data summary: matched=%d, mapped=%d, delisted=%d, not_found=%d",
+                matched, mapped, delisted, not_found)
 
     if stock_data:
         return pd.DataFrame(stock_data)
@@ -277,14 +295,14 @@ def enrich_with_stock_data(df: pd.DataFrame) -> pd.DataFrame:
     tickers = df['stock_ticker'].dropna().unique().tolist()
 
     if not tickers:
-        print("No tickers found in data, skipping stock enrichment")
+        logger.info("No tickers found in data, skipping stock enrichment")
         return df
 
     # Fetch stock data
     stock_df = fetch_all_stock_data(tickers)
 
     if stock_df.empty:
-        print("No stock data retrieved, skipping enrichment")
+        logger.warning("No stock data retrieved, skipping enrichment")
         return df
 
     # Merge stock data with breach data on ticker
@@ -303,7 +321,7 @@ def enrich_with_stock_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Count enriched records
     enriched_count = df['yf_ticker'].notna().sum()
-    print(f"\nEnriched {enriched_count} records with stock data")
+    logger.info("Enriched %d records with stock data", enriched_count)
 
     return df
 
@@ -313,7 +331,7 @@ def add_ticker_status(df: pd.DataFrame) -> pd.DataFrame:
 
     def get_status(row):
         ticker = row.get('stock_ticker')
-        if pd.isna(ticker) or ticker == 'nan':
+        if pd.isna(ticker):
             return 'no_ticker', None
 
         ticker_upper = str(ticker).upper().strip()
@@ -338,12 +356,10 @@ def add_ticker_status(df: pd.DataFrame) -> pd.DataFrame:
     df['ticker_status'] = [s[0] for s in statuses]
     df['ticker_status_note'] = [s[1] for s in statuses]
 
-    # Print summary
-    print("\nTicker status summary:")
     for status in ['active', 'mapped', 'delisted', 'not_found', 'no_ticker']:
         count = (df['ticker_status'] == status).sum()
         if count > 0:
-            print(f"  - {status}: {count} records")
+            logger.info("Ticker status %s: %d records", status, count)
 
     return df
 
@@ -425,8 +441,8 @@ def fetch_newsapi_news(company_name: str, limit: int = 10) -> list:
             "apiKey": NEWSAPI_KEY,
         }
 
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
+        response = _request_with_retry(url, params=params)
+        if response and response.status_code == 200:
             data = response.json()
             for article in data.get("articles", []):
                 articles.append({
@@ -440,7 +456,7 @@ def fetch_newsapi_news(company_name: str, limit: int = 10) -> list:
                 })
         time.sleep(0.5)  # Rate limiting
     except Exception as e:
-        print(f"    NewsAPI error for {company_name}: {e}")
+        logger.warning("NewsAPI error for %s: %s", company_name, e)
 
     return articles
 
@@ -467,8 +483,8 @@ def fetch_guardian_news(company_name: str, limit: int = 10) -> list:
             "show-fields": "headline,trailText,byline,publication"
         }
 
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
+        response = _request_with_retry(url, params=params)
+        if response and response.status_code == 200:
             data = response.json()
             for item in data.get("response", {}).get("results", []):
                 fields = item.get("fields", {})
@@ -483,7 +499,7 @@ def fetch_guardian_news(company_name: str, limit: int = 10) -> list:
                 })
         time.sleep(0.5)  # Rate limiting
     except Exception as e:
-        print(f"    Guardian error for {company_name}: {e}")
+        logger.warning("Guardian error for %s: %s", company_name, e)
 
     return articles
 
@@ -508,8 +524,8 @@ def fetch_nyt_news(company_name: str, limit: int = 10) -> list:
             "api-key": NYT_API_KEY,
         }
 
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
+        response = _request_with_retry(url, params=params)
+        if response and response.status_code == 200:
             data = response.json()
             for doc in data.get("response", {}).get("docs", [])[:limit]:
                 articles.append({
@@ -524,15 +540,21 @@ def fetch_nyt_news(company_name: str, limit: int = 10) -> list:
                 })
         time.sleep(1)  # Rate limiting (NYT has stricter limits)
     except Exception as e:
-        print(f"    NYT error for {company_name}: {e}")
+        logger.warning("NYT error for %s: %s", company_name, e)
 
     return articles
 
 
 def fetch_all_news_for_company(company_name: str, ticker: str = None) -> dict:
-    """Fetch news from all sources for a single company."""
-    # Use company name for search
+    """Fetch news from all sources for a single company.
+
+    Uses company_name as the primary search term. If a ticker is provided
+    and non-empty, it is appended to broaden the search (helps when the
+    company is better known by its ticker symbol).
+    """
     search_term = company_name
+    if ticker and not pd.isna(ticker):
+        search_term = f"{company_name} OR {ticker}"
 
     reddit_articles = fetch_reddit_news(search_term)
     guardian_articles = fetch_guardian_news(search_term)
@@ -554,17 +576,14 @@ def fetch_all_news_for_company(company_name: str, ticker: str = None) -> dict:
 
 def fetch_news_for_companies(companies: list) -> pd.DataFrame:
     """Fetch news data for all unique companies."""
-    print(f"\n=== Fetching News Data (Reddit, Guardian, NYT) ===\n")
-    print(f"Unique companies to search: {len(companies)}")
-    print(f"Date range: {NEWS_START_DATE} to {NEWS_END_DATE}")
-
-    # Check API key status
-    print(f"\nAPI Status:")
-    print(f"  - Reddit: {'Available (PRAW)' if REDDIT_CLIENT else 'MISSING (set REDDIT_CLIENT_ID & REDDIT_CLIENT_SECRET)'}")
-    print(f"  - Guardian: {'Available' if GUARDIAN_API_KEY else 'MISSING KEY (set GUARDIAN_API_KEY)'}")
-    print(f"  - NYT: {'Available' if NYT_API_KEY else 'MISSING KEY (set NYT_API_KEY)'}")
-    print(f"  - NewsAPI: {'Available' if NEWSAPI_KEY else 'MISSING KEY (set NEWSAPI_KEY)'}")
-    print()
+    logger.info("Fetching News Data (Reddit, Guardian, NYT, NewsAPI)")
+    logger.info("Unique companies to search: %d", len(companies))
+    logger.info("Date range: %s to %s", NEWS_START_DATE, NEWS_END_DATE)
+    logger.info("API Status: Reddit=%s, Guardian=%s, NYT=%s, NewsAPI=%s",
+                'OK' if REDDIT_CLIENT else 'MISSING',
+                'OK' if GUARDIAN_API_KEY else 'MISSING',
+                'OK' if NYT_API_KEY else 'MISSING',
+                'OK' if NEWSAPI_KEY else 'MISSING')
 
     news_data = []
 
@@ -575,7 +594,7 @@ def fetch_news_for_companies(companies: list) -> pd.DataFrame:
         if not company_name or company_name == 'nan':
             continue
 
-        print(f"  [{i+1}/{len(companies)}] {company_name[:40]}...", end=" ")
+        logger.info("  [%d/%d] %s", i+1, len(companies), company_name[:40])
 
         news = fetch_all_news_for_company(company_name, ticker)
         news["company_name"] = company_name
@@ -594,13 +613,27 @@ def fetch_news_for_companies(companies: list) -> pd.DataFrame:
         del news["newsapi_articles"]
 
         news_data.append(news)
-        print(f"R:{news['reddit_count']} G:{news['guardian_count']} N:{news['nyt_count']} A:{news['newsapi_count']}")
+        logger.debug("  R:%d G:%d N:%d A:%d", news['reddit_count'], news['guardian_count'], news['nyt_count'], news['newsapi_count'])
 
-    print(f"\nNews fetch complete.")
+    logger.info("News fetch complete")
 
     if news_data:
         return pd.DataFrame(news_data)
     return pd.DataFrame()
+
+
+def _normalize_company_name(name: str) -> str:
+    """Normalize company name for matching: lowercase, strip suffixes and punctuation."""
+    if pd.isna(name):
+        return ""
+    name = str(name).lower().strip()
+    # Strip common corporate suffixes
+    for suffix in [", inc.", ", inc", " inc.", " inc", ", llc", " llc",
+                   ", ltd.", ", ltd", " ltd.", " ltd", ", corp.", ", corp",
+                   " corp.", " corp", ", co.", " co.", " company", " corporation"]:
+        if name.endswith(suffix):
+            name = name[:-len(suffix)]
+    return name.strip()
 
 
 def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
@@ -613,25 +646,34 @@ def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     if not company_list:
-        print("No companies found, skipping news enrichment")
+        logger.info("No companies found, skipping news enrichment")
         return df
 
     # Fetch news data
     news_df = fetch_news_for_companies(company_list)
 
     if news_df.empty:
-        print("No news data retrieved, skipping enrichment")
+        logger.warning("No news data retrieved, skipping enrichment")
         return df
 
-    # Merge news data with breach data on company name
+    # Normalize names for merge to handle minor differences
+    df['_merge_key'] = df['org_name'].apply(_normalize_company_name)
+    news_df['_merge_key'] = news_df['company_name'].apply(_normalize_company_name)
+
     df = df.merge(
         news_df,
-        left_on='org_name',
-        right_on='company_name',
+        on='_merge_key',
         how='left'
     )
 
-    # Clean up duplicate columns
+    # Log companies that failed to match
+    unmatched = df[df['total_news_count'].isna() & df['org_name'].notna()]['org_name'].unique()
+    if len(unmatched) > 0:
+        logger.warning("%d companies had no news match (possible name mismatch): %s",
+                       len(unmatched), list(unmatched[:10]))
+
+    # Clean up merge columns
+    df = df.drop(columns=['_merge_key'])
     if 'company_name' in df.columns:
         df = df.drop(columns=['company_name'])
     if 'stock_ticker_y' in df.columns:
@@ -641,7 +683,7 @@ def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
     # Count enriched records
     enriched_count = df['total_news_count'].notna().sum()
     total_articles = df['total_news_count'].sum()
-    print(f"\nEnriched {enriched_count} records with news data ({int(total_articles)} total articles)")
+    logger.info("Enriched %d records with news data (%d total articles)", enriched_count, int(total_articles))
 
     return df
 
@@ -665,12 +707,12 @@ def fetch_vix_data() -> pd.DataFrame:
     Returns daily VIX values from 2005-2025.
     Uses FRED's public API endpoint (no API key required for basic access).
     """
-    print(f"\n=== Fetching VIX Data from Federal Reserve (FRED) ===\n")
-    print(f"Date range: {VIX_START_DATE} to {VIX_END_DATE}")
+    logger.info("Fetching VIX Data from Federal Reserve (FRED)")
+    logger.info("Date range: %s to %s", VIX_START_DATE, VIX_END_DATE)
 
     try:
         # Use FRED's public CSV download endpoint
-        print("Fetching VIX data from FRED...")
+        logger.info("Fetching VIX data from FRED...")
         url = (
             f"https://fred.stlouisfed.org/graph/fredgraph.csv"
             f"?id=VIXCLS"
@@ -688,15 +730,15 @@ def fetch_vix_data() -> pd.DataFrame:
         # Remove any rows with missing VIX values (FRED uses '.' for missing)
         vix_df = vix_df.dropna(subset=['vix_close'])
 
-        print(f"Retrieved {len(vix_df)} daily VIX observations")
-        print(f"Date range: {vix_df['date'].min().strftime('%Y-%m-%d')} to {vix_df['date'].max().strftime('%Y-%m-%d')}")
-        print(f"VIX range: {vix_df['vix_close'].min():.2f} to {vix_df['vix_close'].max():.2f}")
-        print(f"VIX mean: {vix_df['vix_close'].mean():.2f}")
+        logger.info("Retrieved %d daily VIX observations (%s to %s)",
+                    len(vix_df), vix_df['date'].min().strftime('%Y-%m-%d'), vix_df['date'].max().strftime('%Y-%m-%d'))
+        logger.info("VIX range: %.2f to %.2f, mean: %.2f",
+                    vix_df['vix_close'].min(), vix_df['vix_close'].max(), vix_df['vix_close'].mean())
 
         return vix_df
 
     except Exception as e:
-        print(f"Error fetching VIX data: {e}")
+        logger.error("Error fetching VIX data: %s", e)
         return pd.DataFrame()
 
 
@@ -782,14 +824,14 @@ def enrich_with_vix_data(df: pd.DataFrame) -> pd.DataFrame:
     vix_df = fetch_vix_data()
 
     if vix_df.empty:
-        print("No VIX data available, skipping enrichment")
+        logger.warning("No VIX data available, skipping enrichment")
         # Add empty columns
         for col in ['vix_at_breach', 'vix_7d_before', 'vix_30d_before',
                     'vix_7d_after', 'vix_30d_after', 'vix_30d_avg', 'vix_90d_avg']:
             df[col] = None
         return df
 
-    print(f"\nCalculating VIX metrics for {len(df)} breach records...")
+    logger.info("Calculating VIX metrics for %d breach records...", len(df))
 
     # Calculate VIX metrics for each breach
     vix_metrics_list = []
@@ -799,7 +841,7 @@ def enrich_with_vix_data(df: pd.DataFrame) -> pd.DataFrame:
         vix_metrics_list.append(metrics)
 
         if (idx + 1) % 200 == 0:
-            print(f"  Processed {idx + 1}/{len(df)} records")
+            logger.info("  Processed %d/%d records", idx + 1, len(df))
 
     # Convert to DataFrame and merge
     vix_metrics_df = pd.DataFrame(vix_metrics_list)
@@ -810,13 +852,9 @@ def enrich_with_vix_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Count enriched records
     enriched_count = df['vix_at_breach'].notna().sum()
-    print(f"\nEnriched {enriched_count} records with VIX data")
-
-    # Print summary statistics
-    print(f"\nVIX Summary at Breach Dates:")
-    print(f"  Mean VIX: {df['vix_at_breach'].mean():.2f}")
-    print(f"  Min VIX: {df['vix_at_breach'].min():.2f}")
-    print(f"  Max VIX: {df['vix_at_breach'].max():.2f}")
+    logger.info("Enriched %d records with VIX data", enriched_count)
+    logger.info("VIX at breach dates: mean=%.2f, min=%.2f, max=%.2f",
+                df['vix_at_breach'].mean(), df['vix_at_breach'].min(), df['vix_at_breach'].max())
 
     return df
 
@@ -827,8 +865,8 @@ def main():
     df = load_breach_data("Data_Breach_Enriched_Final.csv")
 
     # Display initial data info
-    print(f"\nColumns: {list(df.columns)}")
-    print(f"Shape: {df.shape}")
+    logger.info("Columns: %s", list(df.columns))
+    logger.info("Shape: %s", df.shape)
 
     # Run cleaning pipeline
     df_cleaned = clean_pipeline(df)
@@ -849,6 +887,10 @@ def main():
 
 
 if __name__ == "__main__":
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
     main()
 
 
