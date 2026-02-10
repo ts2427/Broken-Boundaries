@@ -11,8 +11,11 @@ import requests
 import praw
 import time
 import os
+import io
 import json
 import logging
+import zipfile
+import urllib.request
 from pathlib import Path
 from typing import Optional
 from datetime import datetime
@@ -151,6 +154,227 @@ def save_cleaned_data(df: pd.DataFrame, filename: str = "breach_data_cleaned.csv
     output_path = OUTPUT_DIR / filename
     df.to_csv(output_path, index=False)
     logger.info("Saved cleaned data to %s", output_path)
+
+
+# =============================================================================
+# FAMA-FRENCH FACTOR DATA (Kenneth French Data Library)
+# =============================================================================
+# Fetches the Fama-French 5-Factor model data from Kenneth French's website.
+# Factors: Mkt-RF (market excess return), SMB (size), HML (value),
+#          RMW (profitability), CMA (investment), RF (risk-free rate)
+# Source: https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/data_library.html
+# Values are in percentage points (1.5 = 1.5% return)
+# Daily data available from July 1963 onward for the 5-factor model.
+# =============================================================================
+
+FF_DATASET_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
+
+
+def fetch_fama_french_data() -> pd.DataFrame:
+    """
+    Fetch daily Fama-French 5-Factor data from Kenneth French's data library.
+    Downloads the ZIP/CSV directly from Dartmouth. Falls back to
+    pandas_datareader if the direct download fails.
+
+    Returns a DataFrame with columns: Mkt-RF, SMB, HML, RMW, CMA, RF
+    indexed by date. Values are in percentage points.
+    """
+    logger.info("Fetching Fama-French 5-Factor daily data")
+
+    df = _fetch_ff_direct()
+    if df is not None and not df.empty:
+        return df
+
+    df = _fetch_ff_datareader()
+    if df is not None and not df.empty:
+        return df
+
+    logger.error("All Fama-French data sources failed")
+    return pd.DataFrame()
+
+
+def _fetch_ff_direct() -> Optional[pd.DataFrame]:
+    """Download Fama-French factors directly from Kenneth French's website."""
+    for attempt in range(3):
+        try:
+            logger.info("Downloading Fama-French data from Dartmouth (attempt %d/3)", attempt + 1)
+            response = urllib.request.urlopen(FF_DATASET_URL, timeout=30)
+            zip_data = io.BytesIO(response.read())
+
+            with zipfile.ZipFile(zip_data) as zf:
+                csv_filename = zf.namelist()[0]
+                with zf.open(csv_filename) as csv_file:
+                    raw_text = csv_file.read().decode('utf-8')
+
+            lines = raw_text.strip().split('\n')
+
+            # Find the header row containing 'Mkt-RF'
+            header_idx = None
+            for i, line in enumerate(lines):
+                if 'Mkt-RF' in line:
+                    header_idx = i
+                    break
+
+            if header_idx is None:
+                logger.warning("Could not find header row in Fama-French CSV")
+                return None
+
+            # Collect data lines until we hit a blank line or non-numeric row
+            data_lines = [lines[header_idx]]
+            for line in lines[header_idx + 1:]:
+                stripped = line.strip()
+                if not stripped or not stripped[0].isdigit():
+                    break
+                data_lines.append(stripped)
+
+            df = pd.read_csv(io.StringIO('\n'.join(data_lines)), index_col=0)
+            df.index.name = 'date'
+            df.index = pd.to_datetime(df.index.astype(str).str.strip(), format='%Y%m%d')
+            df.columns = [c.strip() for c in df.columns]
+
+            # Standardize column names
+            rename_map = {
+                'Mkt-RF': 'Mkt-RF', 'SMB': 'SMB', 'HML': 'HML',
+                'RMW': 'RMW', 'CMA': 'CMA', 'RF': 'RF',
+            }
+            df = df.rename(columns=rename_map)
+
+            logger.info("Retrieved %d daily Fama-French observations (%s to %s)",
+                        len(df), df.index.min().strftime('%Y-%m-%d'), df.index.max().strftime('%Y-%m-%d'))
+            return df
+
+        except Exception as e:
+            wait = 2 ** attempt
+            logger.warning("Fama-French direct download failed (%s), retrying in %ds", e, wait)
+            time.sleep(wait)
+
+    return None
+
+
+def _fetch_ff_datareader() -> Optional[pd.DataFrame]:
+    """Fallback: fetch Fama-French data via pandas_datareader."""
+    try:
+        import pandas_datareader.data as web
+    except ImportError:
+        logger.warning("pandas_datareader not installed, skipping fallback")
+        return None
+
+    try:
+        logger.info("Trying pandas_datareader fallback for Fama-French data")
+        result = web.DataReader(
+            'F-F_Research_Data_5_Factors_2x3_daily',
+            'famafrench',
+            start='1963-07-01',
+        )
+        df = result[0]
+        df.index.name = 'date'
+        df.columns = [c.strip() for c in df.columns]
+        logger.info("Retrieved %d observations via pandas_datareader", len(df))
+        return df
+    except Exception as e:
+        logger.warning("pandas_datareader Fama-French fetch failed: %s", e)
+        return None
+
+
+def calculate_ff_metrics(ff_df: pd.DataFrame, breach_date: pd.Timestamp) -> dict:
+    """
+    Calculate Fama-French factor metrics around a breach date.
+    Returns factor values at breach date, and 30-day / 90-day rolling averages.
+    """
+    empty = {
+        'ff_mkt_rf': None, 'ff_smb': None, 'ff_hml': None,
+        'ff_rmw': None, 'ff_cma': None, 'ff_rf': None,
+        'ff_mkt_rf_30d_avg': None, 'ff_smb_30d_avg': None,
+        'ff_hml_30d_avg': None, 'ff_rmw_30d_avg': None,
+        'ff_cma_30d_avg': None,
+        'ff_mkt_rf_90d_avg': None, 'ff_smb_90d_avg': None,
+        'ff_hml_90d_avg': None, 'ff_rmw_90d_avg': None,
+        'ff_cma_90d_avg': None,
+    }
+
+    if ff_df.empty or pd.isna(breach_date):
+        return empty
+
+    if isinstance(breach_date, str):
+        breach_date = pd.to_datetime(breach_date)
+
+    # Closest trading day to breach date
+    idx = (ff_df.index - breach_date).abs()
+    if idx.min() > pd.Timedelta(days=5):
+        return empty
+    closest_idx = idx.argmin()
+
+    row = ff_df.iloc[closest_idx]
+    result = {
+        'ff_mkt_rf': round(float(row['Mkt-RF']), 4),
+        'ff_smb': round(float(row['SMB']), 4),
+        'ff_hml': round(float(row['HML']), 4),
+        'ff_rmw': round(float(row['RMW']), 4),
+        'ff_cma': round(float(row['CMA']), 4),
+        'ff_rf': round(float(row['RF']), 4),
+    }
+
+    # 30-day window averages (+/- 15 days)
+    mask_30d = (
+        (ff_df.index >= breach_date - pd.Timedelta(days=15)) &
+        (ff_df.index <= breach_date + pd.Timedelta(days=15))
+    )
+    if mask_30d.any():
+        window = ff_df[mask_30d]
+        for factor, col in [('mkt_rf', 'Mkt-RF'), ('smb', 'SMB'), ('hml', 'HML'),
+                            ('rmw', 'RMW'), ('cma', 'CMA')]:
+            result[f'ff_{factor}_30d_avg'] = round(float(window[col].mean()), 4)
+
+    # 90-day window averages (+/- 45 days)
+    mask_90d = (
+        (ff_df.index >= breach_date - pd.Timedelta(days=45)) &
+        (ff_df.index <= breach_date + pd.Timedelta(days=45))
+    )
+    if mask_90d.any():
+        window = ff_df[mask_90d]
+        for factor, col in [('mkt_rf', 'Mkt-RF'), ('smb', 'SMB'), ('hml', 'HML'),
+                            ('rmw', 'RMW'), ('cma', 'CMA')]:
+            result[f'ff_{factor}_90d_avg'] = round(float(window[col].mean()), 4)
+
+    return result
+
+
+def enrich_with_fama_french_data(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Enrich breach data with Fama-French 5-Factor metrics.
+    Adds factor values at each breach date plus rolling averages.
+    """
+    ff_df = fetch_fama_french_data()
+
+    if ff_df.empty:
+        logger.warning("No Fama-French data available, skipping enrichment")
+        for col in ['ff_mkt_rf', 'ff_smb', 'ff_hml', 'ff_rmw', 'ff_cma', 'ff_rf',
+                    'ff_mkt_rf_30d_avg', 'ff_smb_30d_avg', 'ff_hml_30d_avg',
+                    'ff_rmw_30d_avg', 'ff_cma_30d_avg',
+                    'ff_mkt_rf_90d_avg', 'ff_smb_90d_avg', 'ff_hml_90d_avg',
+                    'ff_rmw_90d_avg', 'ff_cma_90d_avg']:
+            df[col] = None
+        return df
+
+    logger.info("Calculating Fama-French metrics for %d breach records...", len(df))
+
+    ff_metrics_list = []
+    for idx, row in df.iterrows():
+        breach_date = row.get('breach_date')
+        metrics = calculate_ff_metrics(ff_df, breach_date)
+        ff_metrics_list.append(metrics)
+
+        if (idx + 1) % 200 == 0:
+            logger.info("  Processed %d/%d records", idx + 1, len(df))
+
+    ff_metrics_df = pd.DataFrame(ff_metrics_list)
+    for col in ff_metrics_df.columns:
+        df[col] = ff_metrics_df[col].values
+
+    enriched_count = df['ff_mkt_rf'].notna().sum()
+    logger.info("Enriched %d records with Fama-French data", enriched_count)
+
+    return df
 
 
 # =============================================================================
@@ -880,10 +1104,13 @@ def main():
     # Enrich with VIX (Volatility Index) data from Federal Reserve
     df_with_vix = enrich_with_vix_data(df_with_news)
 
-    # Save enriched data
-    save_cleaned_data(df_with_vix, "breach_data_enriched.csv")
+    # Enrich with Fama-French 5-Factor data from Kenneth French Data Library
+    df_with_ff = enrich_with_fama_french_data(df_with_vix)
 
-    return df_with_vix
+    # Save enriched data
+    save_cleaned_data(df_with_ff, "breach_data_enriched.csv")
+
+    return df_with_ff
 
 
 if __name__ == "__main__":
@@ -1305,6 +1532,120 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "float64",
                 "nullable": True,
                 "description": "Average VIX in 90-day window around breach (+/- 45 days)",
+            },
+            # --- Fama-French 5-Factor Data (Kenneth French Data Library) ---
+            # Values are in percentage points (1.5 = 1.5% return)
+            "ff_mkt_rf": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Fama-French market excess return (Mkt-RF) at breach date, in pct points",
+            },
+            "ff_smb": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Fama-French Small Minus Big (SMB) size factor at breach date, in pct points",
+            },
+            "ff_hml": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Fama-French High Minus Low (HML) value factor at breach date, in pct points",
+            },
+            "ff_rmw": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Fama-French Robust Minus Weak (RMW) profitability factor at breach date, in pct points",
+            },
+            "ff_cma": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Fama-French Conservative Minus Aggressive (CMA) investment factor at breach date, in pct points",
+            },
+            "ff_rf": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Risk-free rate (1-month T-bill) at breach date, in pct points",
+            },
+            "ff_mkt_rf_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average Mkt-RF in 30-day window around breach (+/- 15 days)",
+            },
+            "ff_smb_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average SMB in 30-day window around breach (+/- 15 days)",
+            },
+            "ff_hml_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average HML in 30-day window around breach (+/- 15 days)",
+            },
+            "ff_rmw_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average RMW in 30-day window around breach (+/- 15 days)",
+            },
+            "ff_cma_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average CMA in 30-day window around breach (+/- 15 days)",
+            },
+            "ff_mkt_rf_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average Mkt-RF in 90-day window around breach (+/- 45 days)",
+            },
+            "ff_smb_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average SMB in 90-day window around breach (+/- 45 days)",
+            },
+            "ff_hml_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average HML in 90-day window around breach (+/- 45 days)",
+            },
+            "ff_rmw_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average RMW in 90-day window around breach (+/- 45 days)",
+            },
+            "ff_cma_90d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,4)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Average CMA in 90-day window around breach (+/- 45 days)",
             },
         },
     }
