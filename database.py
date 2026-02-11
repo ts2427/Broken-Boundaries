@@ -400,6 +400,60 @@ def print_database_info(db_path: Optional[Path] = None):
 
 
 # =============================================================================
+# EXTERNAL DATA ACCESSORS
+# =============================================================================
+# These wrap clean.py fetch/compute functions so model.py imports only from
+# database.py, enforcing the clean → etl → database → model data flow.
+
+def get_fama_french_data() -> pd.DataFrame:
+    """Fetch daily Fama-French 5-Factor returns (delegates to clean.py)."""
+    from clean import fetch_fama_french_data
+    return fetch_fama_french_data()
+
+
+def get_vix_data() -> pd.DataFrame:
+    """Fetch daily CBOE VIX data (delegates to clean.py)."""
+    from clean import fetch_vix_data
+    return fetch_vix_data()
+
+
+def get_inflation_data() -> pd.DataFrame:
+    """Fetch monthly CPI / inflation data (delegates to clean.py)."""
+    from clean import fetch_inflation_data
+    return fetch_inflation_data()
+
+
+def get_gdp_data() -> pd.DataFrame:
+    """Fetch quarterly real GDP growth data (delegates to clean.py)."""
+    from clean import fetch_gdp_data
+    return fetch_gdp_data()
+
+
+def get_unemployment_data() -> pd.DataFrame:
+    """Fetch monthly unemployment rate data (delegates to clean.py)."""
+    from clean import fetch_unemployment_data
+    return fetch_unemployment_data()
+
+
+def get_interest_rate_data() -> dict:
+    """Fetch interest rate data (Fed Funds, yield spread) (delegates to clean.py)."""
+    from clean import fetch_interest_rate_data
+    return fetch_interest_rate_data()
+
+
+def get_finbert_sentiment(texts: pd.Series) -> pd.DataFrame:
+    """Compute FinBERT sentiment scores for texts (delegates to clean.py)."""
+    from clean import compute_finbert_sentiment
+    return compute_finbert_sentiment(texts)
+
+
+def get_lagged_news_sentiment(df: pd.DataFrame, windows=None) -> pd.DataFrame:
+    """Compute pre-breach lagged news sentiment (delegates to clean.py)."""
+    from clean import compute_lagged_news_sentiment
+    return compute_lagged_news_sentiment(df, windows=windows)
+
+
+# =============================================================================
 # OLS HELPER
 # =============================================================================
 

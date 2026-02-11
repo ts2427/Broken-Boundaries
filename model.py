@@ -18,6 +18,14 @@ from database import (
     get_sector_breakdown,
     get_yearly_breakdown,
     DB_PATH,
+    get_fama_french_data,
+    get_vix_data,
+    get_inflation_data,
+    get_gdp_data,
+    get_unemployment_data,
+    get_interest_rate_data,
+    get_finbert_sentiment,
+    get_lagged_news_sentiment,
 )
 
 logger = logging.getLogger(__name__)
@@ -26,23 +34,23 @@ logger = logging.getLogger(__name__)
 # DATA LOADING
 # =============================================================================
 
-CLEANED_DATA_DIR = Path(__file__).parent / "cleaned"
-
-
-def load_enriched_data(filename: str = "breach_data_enriched.csv") -> pd.DataFrame:
+def load_enriched_data() -> pd.DataFrame:
     """
-    Load the enriched breach data produced by clean.py.
+    Load the enriched breach data from the database.
     This is the primary entry point for model.py — all analysis starts here.
+    Data flows: clean.py → etl.py → database → here.
     """
-    filepath = CLEANED_DATA_DIR / filename
-    if not filepath.exists():
-        raise FileNotFoundError(
-            f"Cleaned data not found at {filepath}. Run clean.py first."
+    df = query_df("SELECT * FROM breach_incidents")
+
+    if df.empty:
+        raise RuntimeError(
+            "No data in breach_incidents table. Run etl.py first."
         )
-    try:
-        df = pd.read_csv(filepath, encoding="utf-8")
-    except UnicodeDecodeError:
-        df = pd.read_csv(filepath, encoding="latin-1")
+
+    # Drop ETL metadata columns
+    etl_cols = [c for c in ("id", "_etl_loaded_at", "_etl_source") if c in df.columns]
+    if etl_cols:
+        df = df.drop(columns=etl_cols)
 
     # Parse date columns
     for col in ["reported_date", "breach_date", "end_breach_date"]:
@@ -67,7 +75,7 @@ def load_enriched_data(filename: str = "breach_data_enriched.csv") -> pd.DataFra
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    logger.info("Loaded %d records with %d columns from %s", len(df), len(df.columns), filename)
+    logger.info("Loaded %d records with %d columns from database", len(df), len(df.columns))
     return df
 
 
@@ -806,13 +814,11 @@ def prepare_ff_vix_data() -> pd.DataFrame:
     Returns a DataFrame with columns:
       date, Mkt-RF, SMB, HML, RMW, CMA, RF, vix_close, high_vol
     """
-    from clean import fetch_fama_french_data, fetch_vix_data
-
-    ff_df = fetch_fama_french_data()
+    ff_df = get_fama_french_data()
     if ff_df.empty:
         raise RuntimeError("Fama-French data unavailable.")
 
-    vix_df = fetch_vix_data()
+    vix_df = get_vix_data()
     if vix_df.empty:
         raise RuntimeError("VIX data unavailable.")
 
@@ -990,23 +996,14 @@ def prepare_ff_vix_macro_data() -> pd.DataFrame:
       - fed_funds_rate: Federal Funds Effective Rate (%)
       - yield_spread: 10Y Treasury - 2Y Treasury (%)
     """
-    from clean import (
-        fetch_fama_french_data,
-        fetch_vix_data,
-        fetch_inflation_data,
-        fetch_gdp_data,
-        fetch_unemployment_data,
-        fetch_interest_rate_data,
-    )
-
     # --- Base data (daily) ---
-    ff_df = fetch_fama_french_data()
+    ff_df = get_fama_french_data()
     if ff_df.empty:
         raise RuntimeError("Fama-French data unavailable.")
     ff_work = ff_df.reset_index()
     ff_work['date'] = pd.to_datetime(ff_work['date'])
 
-    vix_df = fetch_vix_data()
+    vix_df = get_vix_data()
     if vix_df.empty:
         raise RuntimeError("VIX data unavailable.")
     vix_df['date'] = pd.to_datetime(vix_df['date'])
@@ -1016,7 +1013,7 @@ def prepare_ff_vix_macro_data() -> pd.DataFrame:
 
     # --- Inflation (monthly → daily via forward-fill) ---
     try:
-        cpi_df = fetch_inflation_data()
+        cpi_df = get_inflation_data()
         if not cpi_df.empty:
             cpi_df['date'] = pd.to_datetime(cpi_df['date'])
             cpi_daily = cpi_df[['date', 'inflation_yoy']].sort_values('date')
@@ -1030,7 +1027,7 @@ def prepare_ff_vix_macro_data() -> pd.DataFrame:
 
     # --- GDP growth (quarterly → daily via forward-fill) ---
     try:
-        gdp_df = fetch_gdp_data()
+        gdp_df = get_gdp_data()
         if not gdp_df.empty:
             gdp_df['date'] = pd.to_datetime(gdp_df['date'])
             gdp_daily = gdp_df[['date', 'gdp_growth']].sort_values('date')
@@ -1044,7 +1041,7 @@ def prepare_ff_vix_macro_data() -> pd.DataFrame:
 
     # --- Unemployment rate (monthly → daily via forward-fill) ---
     try:
-        ur_df = fetch_unemployment_data()
+        ur_df = get_unemployment_data()
         if not ur_df.empty:
             ur_df['date'] = pd.to_datetime(ur_df['date'])
             ur_daily = ur_df[['date', 'unemployment_rate']].sort_values('date')
@@ -1058,7 +1055,7 @@ def prepare_ff_vix_macro_data() -> pd.DataFrame:
 
     # --- Interest rates (daily) ---
     try:
-        rate_data = fetch_interest_rate_data()
+        rate_data = get_interest_rate_data()
         # Fed Funds Rate
         ff_rate = rate_data.get('fed_funds', pd.DataFrame())
         if not ff_rate.empty:
@@ -1290,15 +1287,6 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
     Build breach-level dataset: one row per breach event with FF factors,
     VIX, macro controls, and company stock data at the breach date.
     """
-    from clean import (
-        fetch_fama_french_data,
-        fetch_vix_data,
-        fetch_inflation_data,
-        fetch_gdp_data,
-        fetch_unemployment_data,
-        fetch_interest_rate_data,
-    )
-
     # --- Filter to breaches with valid dates and stock data ---
     mask = (
         df['breach_date'].notna()
@@ -1319,7 +1307,7 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
     work['high_vol'] = (work['vix_at_breach'] >= VIX_THRESHOLD).astype(int)
 
     # --- FF factors at breach date ---
-    ff_df = fetch_fama_french_data()
+    ff_df = get_fama_french_data()
     if ff_df.empty:
         raise RuntimeError("Fama-French data unavailable.")
     ff_work = ff_df.reset_index()
@@ -1335,7 +1323,7 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
     # --- Macro controls (same approach as Step 3) ---
     # Inflation
     try:
-        cpi_df = fetch_inflation_data()
+        cpi_df = get_inflation_data()
         if not cpi_df.empty:
             cpi_df['date'] = pd.to_datetime(cpi_df['date'])
             work = pd.merge_asof(
@@ -1349,7 +1337,7 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # GDP
     try:
-        gdp_df = fetch_gdp_data()
+        gdp_df = get_gdp_data()
         if not gdp_df.empty:
             gdp_df['date'] = pd.to_datetime(gdp_df['date'])
             work = pd.merge_asof(
@@ -1363,7 +1351,7 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Unemployment
     try:
-        ur_df = fetch_unemployment_data()
+        ur_df = get_unemployment_data()
         if not ur_df.empty:
             ur_df['date'] = pd.to_datetime(ur_df['date'])
             work = pd.merge_asof(
@@ -1377,7 +1365,7 @@ def prepare_breach_level_data(df: pd.DataFrame) -> pd.DataFrame:
 
     # Interest rates
     try:
-        rate_data = fetch_interest_rate_data()
+        rate_data = get_interest_rate_data()
         ff_rate = rate_data.get('fed_funds', pd.DataFrame())
         if not ff_rate.empty:
             ff_rate['date'] = pd.to_datetime(ff_rate['date'])
@@ -1598,17 +1586,16 @@ def run_event_study(df: pd.DataFrame) -> Dict[str, Any]:
     import statsmodels.api as sm
     from scipy import stats as scipy_stats
     import yfinance as yf_lib
-    from clean import fetch_fama_french_data, fetch_vix_data
 
     # --- 1. Factor and VIX data ---
-    ff_df = fetch_fama_french_data()
+    ff_df = get_fama_french_data()
     if ff_df.empty:
         raise RuntimeError("Fama-French data unavailable for event study.")
     ff_work = ff_df.reset_index()
     ff_work['date'] = pd.to_datetime(ff_work['date']).dt.normalize()
     ff_work = ff_work.sort_values('date').reset_index(drop=True)
 
-    vix_df = fetch_vix_data()
+    vix_df = get_vix_data()
     if vix_df.empty:
         raise RuntimeError("VIX data unavailable for event study.")
     vix_df['date'] = pd.to_datetime(vix_df['date']).dt.normalize()
@@ -2046,11 +2033,10 @@ def run_sentiment_analysis(df: pd.DataFrame, event_results: Dict[str, Any]) -> D
     """
     import statsmodels.api as sm
     from scipy import stats as scipy_stats
-    from clean import compute_finbert_sentiment
 
     # --- 1. Compute sentiment scores ---
     logger.info("Step 6: Computing FinBERT sentiment on incident_details")
-    sentiment_df = compute_finbert_sentiment(df['incident_details'])
+    sentiment_df = get_finbert_sentiment(df['incident_details'])
     sentiment_df.index = df.index
 
     # Add sentiment columns to df copy
@@ -2454,11 +2440,10 @@ def run_lagged_sentiment_analysis(
     """
     import statsmodels.api as sm
     from scipy import stats as scipy_stats
-    from clean import compute_lagged_news_sentiment
 
     # --- 1. Compute lagged news sentiment ---
     logger.info("Step 7: Computing lagged news sentiment")
-    lagged_df = compute_lagged_news_sentiment(df, windows=LAGGED_WINDOWS)
+    lagged_df = get_lagged_news_sentiment(df, windows=LAGGED_WINDOWS)
     lagged_df.index = df.index
 
     pw = PRIMARY_WINDOW  # 30d
