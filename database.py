@@ -1345,6 +1345,124 @@ def get_repeat_offender_results(db_path=None):
 
 
 # =============================================================================
+# FIGURES STORAGE
+# =============================================================================
+
+def _ensure_figures_table(db_path=None):
+    """Create the figures table if it doesn't exist."""
+    if db_path is None:
+        db_path = DB_PATH
+    with get_connection(db_path) as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS figures (
+            filename TEXT PRIMARY KEY,
+            step TEXT,
+            label TEXT,
+            png_data BLOB NOT NULL,
+            size_bytes INTEGER,
+            created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        )""")
+
+
+def store_figure(filename, step, label, png_path, db_path=None):
+    """
+    Store a single PNG figure in the database.
+
+    Args:
+        filename: e.g. 'fig_1_1_breach_timeline.png'
+        step: e.g. 'step1'
+        label: e.g. '1.1 Breach Timeline'
+        png_path: Path to the PNG file on disk
+        db_path: Optional database path
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    _ensure_figures_table(db_path)
+    png_data = Path(png_path).read_bytes()
+    with get_connection(db_path) as conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO figures (filename, step, label, png_data, size_bytes) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (filename, step, label, png_data, len(png_data)),
+        )
+
+
+def store_figures_batch(figures_list, db_path=None):
+    """
+    Store multiple figures in one transaction.
+
+    Args:
+        figures_list: list of (filename, step, label, png_path) tuples
+        db_path: Optional database path
+    """
+    if db_path is None:
+        db_path = DB_PATH
+    _ensure_figures_table(db_path)
+    with get_connection(db_path) as conn:
+        for filename, step, label, png_path in figures_list:
+            png_data = Path(png_path).read_bytes()
+            conn.execute(
+                "INSERT OR REPLACE INTO figures (filename, step, label, png_data, size_bytes) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (filename, step, label, png_data, len(png_data)),
+            )
+
+
+def get_figure(filename, db_path=None):
+    """
+    Retrieve a figure's PNG data from the database.
+
+    Returns:
+        dict with 'filename', 'step', 'label', 'png_data', 'size_bytes',
+        'created_at', or None if not found.
+    """
+    results = query(
+        "SELECT filename, step, label, png_data, size_bytes, created_at "
+        "FROM figures WHERE filename = ?",
+        (filename,), db_path,
+    )
+    return results[0] if results else None
+
+
+def get_figures_index(db_path=None):
+    """
+    List all stored figures (without BLOB data).
+
+    Returns:
+        DataFrame with filename, step, label, size_bytes, created_at
+    """
+    _ensure_figures_table(db_path)
+    return query_df(
+        "SELECT filename, step, label, size_bytes, created_at FROM figures ORDER BY filename",
+        db_path=db_path,
+    )
+
+
+def export_figure(filename, output_path=None, db_path=None):
+    """
+    Export a figure from the database back to a PNG file.
+
+    Args:
+        filename: The figure filename stored in the DB
+        output_path: Where to write the PNG (defaults to figures/<filename>)
+        db_path: Optional database path
+
+    Returns:
+        Path to the written file, or None if figure not found.
+    """
+    row = get_figure(filename, db_path)
+    if row is None:
+        return None
+    if output_path is None:
+        out_dir = Path(__file__).parent / "figures"
+        out_dir.mkdir(exist_ok=True)
+        output_path = out_dir / filename
+    else:
+        output_path = Path(output_path)
+    output_path.write_bytes(row['png_data'])
+    return output_path
+
+
+# =============================================================================
 # MAIN
 # =============================================================================
 
