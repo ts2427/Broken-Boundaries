@@ -14,6 +14,7 @@ import os
 import io
 import json
 import logging
+import re
 import zipfile
 import urllib.request
 from pathlib import Path
@@ -276,100 +277,64 @@ def _fetch_ff_datareader() -> Optional[pd.DataFrame]:
         return None
 
 
-def calculate_ff_metrics(ff_df: pd.DataFrame, breach_date: pd.Timestamp) -> dict:
-    """
-    Calculate Fama-French factor metrics around a breach date.
-    Returns factor values at breach date, and 30-day / 90-day rolling averages.
-    """
-    empty = {
-        'ff_mkt_rf': None, 'ff_smb': None, 'ff_hml': None,
-        'ff_rmw': None, 'ff_cma': None, 'ff_rf': None,
-        'ff_mkt_rf_30d_avg': None, 'ff_smb_30d_avg': None,
-        'ff_hml_30d_avg': None, 'ff_rmw_30d_avg': None,
-        'ff_cma_30d_avg': None,
-        'ff_mkt_rf_90d_avg': None, 'ff_smb_90d_avg': None,
-        'ff_hml_90d_avg': None, 'ff_rmw_90d_avg': None,
-        'ff_cma_90d_avg': None,
-    }
-
-    if ff_df.empty or pd.isna(breach_date):
-        return empty
-
-    if isinstance(breach_date, str):
-        breach_date = pd.to_datetime(breach_date)
-
-    # Closest trading day to breach date
-    idx = (ff_df.index - breach_date).abs()
-    if idx.min() > pd.Timedelta(days=5):
-        return empty
-    closest_idx = idx.argmin()
-
-    row = ff_df.iloc[closest_idx]
-    result = {
-        'ff_mkt_rf': round(float(row['Mkt-RF']), 4),
-        'ff_smb': round(float(row['SMB']), 4),
-        'ff_hml': round(float(row['HML']), 4),
-        'ff_rmw': round(float(row['RMW']), 4),
-        'ff_cma': round(float(row['CMA']), 4),
-        'ff_rf': round(float(row['RF']), 4),
-    }
-
-    # 30-day window averages (+/- 15 days)
-    mask_30d = (
-        (ff_df.index >= breach_date - pd.Timedelta(days=15)) &
-        (ff_df.index <= breach_date + pd.Timedelta(days=15))
-    )
-    if mask_30d.any():
-        window = ff_df[mask_30d]
-        for factor, col in [('mkt_rf', 'Mkt-RF'), ('smb', 'SMB'), ('hml', 'HML'),
-                            ('rmw', 'RMW'), ('cma', 'CMA')]:
-            result[f'ff_{factor}_30d_avg'] = round(float(window[col].mean()), 4)
-
-    # 90-day window averages (+/- 45 days)
-    mask_90d = (
-        (ff_df.index >= breach_date - pd.Timedelta(days=45)) &
-        (ff_df.index <= breach_date + pd.Timedelta(days=45))
-    )
-    if mask_90d.any():
-        window = ff_df[mask_90d]
-        for factor, col in [('mkt_rf', 'Mkt-RF'), ('smb', 'SMB'), ('hml', 'HML'),
-                            ('rmw', 'RMW'), ('cma', 'CMA')]:
-            result[f'ff_{factor}_90d_avg'] = round(float(window[col].mean()), 4)
-
-    return result
-
-
 def enrich_with_fama_french_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Enrich breach data with Fama-French 5-Factor metrics.
-    Adds factor values at each breach date plus rolling averages.
+    Uses vectorized merge_asof for point-in-time lookups and
+    searchsorted-based window averages.
     """
     ff_df = fetch_fama_french_data()
 
+    factor_cols = ['Mkt-RF', 'SMB', 'HML', 'RMW', 'CMA', 'RF']
+    ff_prefix_map = {
+        'Mkt-RF': 'ff_mkt_rf', 'SMB': 'ff_smb', 'HML': 'ff_hml',
+        'RMW': 'ff_rmw', 'CMA': 'ff_cma', 'RF': 'ff_rf',
+    }
+    avg_name_map = {'Mkt-RF': 'mkt_rf', 'SMB': 'smb', 'HML': 'hml', 'RMW': 'rmw', 'CMA': 'cma'}
+    all_cols = (
+        list(ff_prefix_map.values())
+        + [f'ff_{n}_30d_avg' for n in avg_name_map.values()]
+        + [f'ff_{n}_90d_avg' for n in avg_name_map.values()]
+    )
+
     if ff_df.empty:
         logger.warning("No Fama-French data available, skipping enrichment")
-        for col in ['ff_mkt_rf', 'ff_smb', 'ff_hml', 'ff_rmw', 'ff_cma', 'ff_rf',
-                    'ff_mkt_rf_30d_avg', 'ff_smb_30d_avg', 'ff_hml_30d_avg',
-                    'ff_rmw_30d_avg', 'ff_cma_30d_avg',
-                    'ff_mkt_rf_90d_avg', 'ff_smb_90d_avg', 'ff_hml_90d_avg',
-                    'ff_rmw_90d_avg', 'ff_cma_90d_avg']:
+        for col in all_cols:
             df[col] = None
         return df
 
     logger.info("Calculating Fama-French metrics for %d breach records...", len(df))
 
-    ff_metrics_list = []
-    for idx, row in df.iterrows():
-        breach_date = row.get('breach_date')
-        metrics = calculate_ff_metrics(ff_df, breach_date)
-        ff_metrics_list.append(metrics)
+    # Prepare FF data with date column for merge_asof
+    ff_work = ff_df.reset_index()
+    ff_work['date'] = pd.to_datetime(ff_work['date'])
+    ff_work = ff_work.sort_values('date').reset_index(drop=True)
 
-        if (idx + 1) % 200 == 0:
-            logger.info("  Processed %d/%d records", idx + 1, len(df))
+    has_date = df['breach_date'].notna()
+    for col in all_cols:
+        df[col] = np.nan
 
-    ff_metrics_df = pd.DataFrame(ff_metrics_list)
-    for col in ff_metrics_df.columns:
-        df[col] = ff_metrics_df[col].values
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
+
+        # Point-in-time factor values — nearest trading day within 5 days
+        m = pd.merge_asof(
+            work, ff_work[['date'] + factor_cols],
+            left_on='breach_date', right_on='date',
+            direction='nearest', tolerance=pd.Timedelta(days=5)
+        )
+        m.index = work.index
+        for src_col, dst_col in ff_prefix_map.items():
+            df.loc[m.index, dst_col] = m[src_col].round(4).values
+
+        # Window averages (30-day and 90-day centered)
+        for src_col, name in avg_name_map.items():
+            df[f'ff_{name}_30d_avg'] = _vectorized_window_avg(
+                ff_work['date'], ff_work[src_col], df['breach_date'], days_before=15
+            ).round(4)
+            df[f'ff_{name}_90d_avg'] = _vectorized_window_avg(
+                ff_work['date'], ff_work[src_col], df['breach_date'], days_before=45
+            ).round(4)
 
     enriched_count = df['ff_mkt_rf'].notna().sum()
     logger.info("Enriched %d records with Fama-French data", enriched_count)
@@ -493,6 +458,10 @@ def fetch_all_stock_data(tickers: list) -> pd.DataFrame:
         # Show mapping if applicable
         if note and "Mapped" in note:
             mapped += 1
+
+        # Rate limit Yahoo Finance API calls
+        if i > 0:
+            time.sleep(0.5)
 
         info = fetch_stock_info(current_ticker)
         if info:
@@ -640,7 +609,7 @@ def fetch_reddit_news(company_name: str, limit: int = 10) -> list:
 
         time.sleep(0.5)  # Rate limiting
     except Exception as e:
-        pass  # Fail silently for Reddit
+        logger.warning("Reddit fetch failed for %s: %s", company_name, e)
 
     return articles
 
@@ -884,11 +853,20 @@ def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
     df['_merge_key'] = df['org_name'].apply(_normalize_company_name)
     news_df['_merge_key'] = news_df['company_name'].apply(_normalize_company_name)
 
+    row_count_before = len(df)
     df = df.merge(
         news_df,
         on='_merge_key',
         how='left'
     )
+
+    # Guard against fan-out from duplicate merge keys
+    if len(df) != row_count_before:
+        logger.warning("News merge changed row count from %d to %d (duplicate merge keys)",
+                       row_count_before, len(df))
+        df = df.drop_duplicates(subset=['org_name', 'breach_date'], keep='first')
+        df = df.reset_index(drop=True)
+        logger.info("Deduplicated back to %d rows", len(df))
 
     # Log companies that failed to match
     unmatched = df[df['total_news_count'].isna() & df['org_name'].notna()]['org_name'].unique()
@@ -913,46 +891,105 @@ def enrich_with_news_data(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # =============================================================================
+# FRED (FEDERAL RESERVE ECONOMIC DATA) — SHARED UTILITIES
+# =============================================================================
+# Common helpers for all FRED-sourced macroeconomic indicators:
+#   VIX, CPI/Inflation, GDP, Unemployment, Interest Rates
+# =============================================================================
+
+FRED_START_DATE = "2005-01-01"
+FRED_END_DATE = "2025-12-31"
+
+
+def _fetch_fred_series(series_id: str, value_col: str) -> pd.DataFrame:
+    """
+    Fetch a single FRED series as a two-column DataFrame [date, value_col].
+    Uses the public CSV endpoint (no API key required).
+    Retries up to 3 times with exponential backoff on failure.
+    """
+    url = (
+        f"https://fred.stlouisfed.org/graph/fredgraph.csv"
+        f"?id={series_id}"
+        f"&cosd={FRED_START_DATE}"
+        f"&coed={FRED_END_DATE}"
+    )
+    for attempt in range(3):
+        try:
+            df = pd.read_csv(url)
+            df.columns = ['date', value_col]
+            df['date'] = pd.to_datetime(df['date'])
+            df[value_col] = pd.to_numeric(df[value_col], errors='coerce')
+            df = df.dropna(subset=[value_col])
+            return df
+        except Exception as e:
+            if attempt < 2:
+                wait = 2 ** attempt
+                logger.warning("FRED fetch for %s failed (%s), retry %d/3 in %ds",
+                              series_id, e, attempt + 1, wait)
+                time.sleep(wait)
+            else:
+                raise
+
+
+def _vectorized_window_avg(source_dates: pd.Series, source_values: pd.Series,
+                           target_dates: pd.Series, days_before: int,
+                           days_after: int = None) -> pd.Series:
+    """
+    Compute windowed average of source_values around each target_date.
+    Window: [target - days_before, target + days_after].
+    If days_after is None, uses a symmetric window (days_after = days_before).
+    Uses searchsorted + cumulative sums for O(n log m) performance.
+    """
+    if days_after is None:
+        days_after = days_before
+
+    src_dates = source_dates.values.astype('datetime64[ns]')
+    src_vals = source_values.values.astype('float64')
+    tgt_dates = target_dates.values.astype('datetime64[ns]')
+
+    left = tgt_dates - np.timedelta64(days_before, 'D')
+    right = tgt_dates + np.timedelta64(days_after, 'D')
+
+    left_idx = np.searchsorted(src_dates, left)
+    right_idx = np.searchsorted(src_dates, right, side='right')
+
+    # Handle NaN source values in cumulative sums
+    valid = ~np.isnan(src_vals)
+    clean_vals = np.where(valid, src_vals, 0.0)
+    cumsum = np.concatenate([[0], np.cumsum(clean_vals)])
+    count_cumsum = np.concatenate([[0], np.cumsum(valid.astype(int))])
+
+    counts = count_cumsum[right_idx] - count_cumsum[left_idx]
+    sums = cumsum[right_idx] - cumsum[left_idx]
+
+    result = np.where(counts > 0, sums / counts, np.nan)
+
+    # NaN out rows where target_date is NaT
+    nat_mask = np.isnat(tgt_dates)
+    result[nat_mask] = np.nan
+
+    return pd.Series(result, index=target_dates.index)
+
+
+# =============================================================================
 # VOLATILITY INDEX (VIX) FROM FEDERAL RESERVE
 # =============================================================================
 # Fetches the CBOE Volatility Index (VIX) from FRED (Federal Reserve Economic Data)
 # VIX measures expected market volatility over the next 30 days
 # Series: VIXCLS (CBOE Volatility Index: VIX)
-# Date range: January 1, 2005 - December 31, 2025
 # =============================================================================
-
-VIX_START_DATE = "2005-01-01"
-VIX_END_DATE = "2025-12-31"
 
 
 def fetch_vix_data() -> pd.DataFrame:
     """
     Fetch VIX (Volatility Index) data from FRED.
     Returns daily VIX values from 2005-2025.
-    Uses FRED's public API endpoint (no API key required for basic access).
     """
     logger.info("Fetching VIX Data from Federal Reserve (FRED)")
-    logger.info("Date range: %s to %s", VIX_START_DATE, VIX_END_DATE)
+    logger.info("Date range: %s to %s", FRED_START_DATE, FRED_END_DATE)
 
     try:
-        # Use FRED's public CSV download endpoint
-        logger.info("Fetching VIX data from FRED...")
-        url = (
-            f"https://fred.stlouisfed.org/graph/fredgraph.csv"
-            f"?id=VIXCLS"
-            f"&cosd={VIX_START_DATE}"
-            f"&coed={VIX_END_DATE}"
-        )
-
-        vix_df = pd.read_csv(url)
-        vix_df.columns = ['date', 'vix_close']
-
-        # Clean the data
-        vix_df['date'] = pd.to_datetime(vix_df['date'])
-        vix_df['vix_close'] = pd.to_numeric(vix_df['vix_close'], errors='coerce')
-
-        # Remove any rows with missing VIX values (FRED uses '.' for missing)
-        vix_df = vix_df.dropna(subset=['vix_close'])
+        vix_df = _fetch_fred_series("VIXCLS", "vix_close")
 
         logger.info("Retrieved %d daily VIX observations (%s to %s)",
                     len(vix_df), vix_df['date'].min().strftime('%Y-%m-%d'), vix_df['date'].max().strftime('%Y-%m-%d'))
@@ -966,151 +1003,646 @@ def fetch_vix_data() -> pd.DataFrame:
         return pd.DataFrame()
 
 
-def calculate_vix_metrics(vix_df: pd.DataFrame, breach_date: pd.Timestamp) -> dict:
-    """
-    Calculate VIX metrics around a breach date.
-    Returns VIX values at breach date and surrounding periods.
-    """
-    if vix_df.empty or pd.isna(breach_date):
-        return {
-            'vix_at_breach': None,
-            'vix_7d_before': None,
-            'vix_30d_before': None,
-            'vix_7d_after': None,
-            'vix_30d_after': None,
-            'vix_30d_avg': None,
-            'vix_90d_avg': None,
-        }
-
-    # Convert breach_date to datetime if needed
-    if isinstance(breach_date, str):
-        breach_date = pd.to_datetime(breach_date)
-
-    # Find closest VIX value to breach date
-    vix_df_sorted = vix_df.copy()
-    vix_df_sorted['date'] = pd.to_datetime(vix_df_sorted['date'])
-
-    # VIX at breach date (or closest available)
-    closest_idx = (vix_df_sorted['date'] - breach_date).abs().idxmin()
-    vix_at_breach = vix_df_sorted.loc[closest_idx, 'vix_close']
-
-    # VIX 7 days before
-    date_7d_before = breach_date - pd.Timedelta(days=7)
-    mask_7d_before = vix_df_sorted['date'] <= date_7d_before
-    vix_7d_before = vix_df_sorted[mask_7d_before]['vix_close'].iloc[-1] if mask_7d_before.any() else None
-
-    # VIX 30 days before
-    date_30d_before = breach_date - pd.Timedelta(days=30)
-    mask_30d_before = vix_df_sorted['date'] <= date_30d_before
-    vix_30d_before = vix_df_sorted[mask_30d_before]['vix_close'].iloc[-1] if mask_30d_before.any() else None
-
-    # VIX 7 days after
-    date_7d_after = breach_date + pd.Timedelta(days=7)
-    mask_7d_after = vix_df_sorted['date'] >= date_7d_after
-    vix_7d_after = vix_df_sorted[mask_7d_after]['vix_close'].iloc[0] if mask_7d_after.any() else None
-
-    # VIX 30 days after
-    date_30d_after = breach_date + pd.Timedelta(days=30)
-    mask_30d_after = vix_df_sorted['date'] >= date_30d_after
-    vix_30d_after = vix_df_sorted[mask_30d_after]['vix_close'].iloc[0] if mask_30d_after.any() else None
-
-    # 30-day average around breach
-    mask_30d_window = (
-        (vix_df_sorted['date'] >= breach_date - pd.Timedelta(days=15)) &
-        (vix_df_sorted['date'] <= breach_date + pd.Timedelta(days=15))
-    )
-    vix_30d_avg = vix_df_sorted[mask_30d_window]['vix_close'].mean() if mask_30d_window.any() else None
-
-    # 90-day average around breach
-    mask_90d_window = (
-        (vix_df_sorted['date'] >= breach_date - pd.Timedelta(days=45)) &
-        (vix_df_sorted['date'] <= breach_date + pd.Timedelta(days=45))
-    )
-    vix_90d_avg = vix_df_sorted[mask_90d_window]['vix_close'].mean() if mask_90d_window.any() else None
-
-    return {
-        'vix_at_breach': round(vix_at_breach, 2) if vix_at_breach else None,
-        'vix_7d_before': round(vix_7d_before, 2) if vix_7d_before else None,
-        'vix_30d_before': round(vix_30d_before, 2) if vix_30d_before else None,
-        'vix_7d_after': round(vix_7d_after, 2) if vix_7d_after else None,
-        'vix_30d_after': round(vix_30d_after, 2) if vix_30d_after else None,
-        'vix_30d_avg': round(vix_30d_avg, 2) if vix_30d_avg else None,
-        'vix_90d_avg': round(vix_90d_avg, 2) if vix_90d_avg else None,
-    }
-
-
 def enrich_with_vix_data(df: pd.DataFrame) -> pd.DataFrame:
     """
     Enrich breach data with VIX (Volatility Index) metrics.
-    Adds VIX values at breach date and surrounding periods.
+    Uses vectorized merge_asof for point-in-time lookups and
+    searchsorted-based window averages.
     """
-    # Fetch VIX data
     vix_df = fetch_vix_data()
+    vix_cols = ['vix_at_breach', 'vix_7d_before', 'vix_30d_before',
+                'vix_7d_after', 'vix_30d_after', 'vix_30d_avg', 'vix_90d_avg']
 
     if vix_df.empty:
         logger.warning("No VIX data available, skipping enrichment")
-        # Add empty columns
-        for col in ['vix_at_breach', 'vix_7d_before', 'vix_30d_before',
-                    'vix_7d_after', 'vix_30d_after', 'vix_30d_avg', 'vix_90d_avg']:
+        for col in vix_cols:
             df[col] = None
         return df
 
     logger.info("Calculating VIX metrics for %d breach records...", len(df))
+    vix_df = vix_df.sort_values('date').reset_index(drop=True)
 
-    # Calculate VIX metrics for each breach
-    vix_metrics_list = []
-    for idx, row in df.iterrows():
-        breach_date = row.get('breach_date')
-        metrics = calculate_vix_metrics(vix_df, breach_date)
-        vix_metrics_list.append(metrics)
+    has_date = df['breach_date'].notna()
+    for col in vix_cols:
+        df[col] = np.nan
 
-        if (idx + 1) % 200 == 0:
-            logger.info("  Processed %d/%d records", idx + 1, len(df))
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
 
-    # Convert to DataFrame and merge
-    vix_metrics_df = pd.DataFrame(vix_metrics_list)
+        # vix_at_breach — nearest trading day
+        m = pd.merge_asof(work, vix_df, left_on='breach_date', right_on='date', direction='nearest')
+        m.index = work.index
+        df.loc[m.index, 'vix_at_breach'] = m['vix_close'].round(2).values
 
-    # Add VIX columns to main dataframe
-    for col in vix_metrics_df.columns:
-        df[col] = vix_metrics_df[col].values
+        # vix_7d_before — last observation on or before breach_date - 7d
+        work['_d'] = work['breach_date'] - pd.Timedelta(days=7)
+        _sorted = work[['_d']].sort_values('_d')
+        m = pd.merge_asof(_sorted, vix_df, left_on='_d', right_on='date', direction='backward')
+        m.index = _sorted.index
+        df.loc[m.index, 'vix_7d_before'] = m['vix_close'].round(2).values
 
-    # Count enriched records
+        # vix_30d_before — last observation on or before breach_date - 30d
+        work['_d'] = work['breach_date'] - pd.Timedelta(days=30)
+        _sorted = work[['_d']].sort_values('_d')
+        m = pd.merge_asof(_sorted, vix_df, left_on='_d', right_on='date', direction='backward')
+        m.index = _sorted.index
+        df.loc[m.index, 'vix_30d_before'] = m['vix_close'].round(2).values
+
+        # vix_7d_after — first observation on or after breach_date + 7d
+        work['_d'] = work['breach_date'] + pd.Timedelta(days=7)
+        _sorted = work[['_d']].sort_values('_d')
+        m = pd.merge_asof(_sorted, vix_df, left_on='_d', right_on='date', direction='forward')
+        m.index = _sorted.index
+        df.loc[m.index, 'vix_7d_after'] = m['vix_close'].round(2).values
+
+        # vix_30d_after — first observation on or after breach_date + 30d
+        work['_d'] = work['breach_date'] + pd.Timedelta(days=30)
+        _sorted = work[['_d']].sort_values('_d')
+        m = pd.merge_asof(_sorted, vix_df, left_on='_d', right_on='date', direction='forward')
+        m.index = _sorted.index
+        df.loc[m.index, 'vix_30d_after'] = m['vix_close'].round(2).values
+
+    # Window averages — vectorized via searchsorted
+    df['vix_30d_avg'] = _vectorized_window_avg(
+        vix_df['date'], vix_df['vix_close'], df['breach_date'], days_before=15
+    ).round(2)
+    df['vix_90d_avg'] = _vectorized_window_avg(
+        vix_df['date'], vix_df['vix_close'], df['breach_date'], days_before=45
+    ).round(2)
+
     enriched_count = df['vix_at_breach'].notna().sum()
     logger.info("Enriched %d records with VIX data", enriched_count)
-    logger.info("VIX at breach dates: mean=%.2f, min=%.2f, max=%.2f",
-                df['vix_at_breach'].mean(), df['vix_at_breach'].min(), df['vix_at_breach'].max())
+    if enriched_count > 0:
+        logger.info("VIX at breach dates: mean=%.2f, min=%.2f, max=%.2f",
+                    df['vix_at_breach'].mean(), df['vix_at_breach'].min(), df['vix_at_breach'].max())
 
     return df
 
 
+# =============================================================================
+# INFLATION (CPI) FROM FEDERAL RESERVE
+# =============================================================================
+# Fetches Consumer Price Index for All Urban Consumers (CPIAUCSL) from FRED
+# Monthly frequency — YoY inflation computed as 12-month pct change
+# Series: CPIAUCSL
+# =============================================================================
+
+def fetch_inflation_data() -> pd.DataFrame:
+    """
+    Fetch CPI data from FRED and compute year-over-year inflation rate.
+    Returns monthly CPI with a derived inflation_yoy column.
+    """
+    logger.info("Fetching CPI / Inflation data from FRED (CPIAUCSL)")
+    try:
+        cpi_df = _fetch_fred_series("CPIAUCSL", "cpi")
+        cpi_df = cpi_df.sort_values('date').reset_index(drop=True)
+        cpi_df['inflation_yoy'] = cpi_df['cpi'].pct_change(12) * 100
+        logger.info("Retrieved %d monthly CPI observations", len(cpi_df))
+        return cpi_df
+    except Exception as e:
+        logger.error("Error fetching CPI data: %s", e)
+        return pd.DataFrame()
+
+
+def enrich_with_inflation_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with CPI / inflation metrics using vectorized merge_asof."""
+    cpi_df = fetch_inflation_data()
+    cols = ['cpi_at_breach', 'inflation_yoy_at_breach', 'inflation_yoy_3m_avg', 'inflation_yoy_12m_avg']
+
+    if cpi_df.empty:
+        logger.warning("No CPI data available, skipping inflation enrichment")
+        for col in cols:
+            df[col] = None
+        return df
+
+    logger.info("Calculating inflation metrics for %d breach records...", len(df))
+
+    # Precompute rolling averages on source data
+    cpi_df['inflation_yoy_3m_avg'] = cpi_df['inflation_yoy'].rolling(3, min_periods=1).mean()
+    cpi_df['inflation_yoy_12m_avg'] = cpi_df['inflation_yoy'].rolling(12, min_periods=1).mean()
+
+    has_date = df['breach_date'].notna()
+    for col in cols:
+        df[col] = np.nan
+
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
+        m = pd.merge_asof(
+            work, cpi_df,
+            left_on='breach_date', right_on='date',
+            direction='backward', tolerance=pd.Timedelta(days=45)
+        )
+        m.index = work.index
+        df.loc[m.index, 'cpi_at_breach'] = m['cpi'].round(2).values
+        df.loc[m.index, 'inflation_yoy_at_breach'] = m['inflation_yoy'].round(2).values
+        df.loc[m.index, 'inflation_yoy_3m_avg'] = m['inflation_yoy_3m_avg'].round(2).values
+        df.loc[m.index, 'inflation_yoy_12m_avg'] = m['inflation_yoy_12m_avg'].round(2).values
+
+    enriched = df['cpi_at_breach'].notna().sum()
+    logger.info("Enriched %d records with inflation data", enriched)
+    return df
+
+
+# =============================================================================
+# GDP GROWTH FROM FEDERAL RESERVE
+# =============================================================================
+# Fetches Real GDP growth rate (% change, seasonally adjusted annual rate)
+# Quarterly frequency — FRED series A191RL1Q225SBEA
+# =============================================================================
+
+def fetch_gdp_data() -> pd.DataFrame:
+    """Fetch quarterly real GDP growth rate from FRED."""
+    logger.info("Fetching GDP growth data from FRED (A191RL1Q225SBEA)")
+    try:
+        gdp_df = _fetch_fred_series("A191RL1Q225SBEA", "gdp_growth")
+        gdp_df = gdp_df.sort_values('date').reset_index(drop=True)
+        logger.info("Retrieved %d quarterly GDP observations", len(gdp_df))
+        return gdp_df
+    except Exception as e:
+        logger.error("Error fetching GDP data: %s", e)
+        return pd.DataFrame()
+
+
+def enrich_with_gdp_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with GDP growth metrics using vectorized merge_asof."""
+    gdp_df = fetch_gdp_data()
+    cols = ['gdp_growth_at_breach', 'gdp_growth_4q_avg']
+
+    if gdp_df.empty:
+        logger.warning("No GDP data available, skipping GDP enrichment")
+        for col in cols:
+            df[col] = None
+        return df
+
+    logger.info("Calculating GDP metrics for %d breach records...", len(df))
+
+    # Precompute 4-quarter rolling average
+    gdp_df['gdp_growth_4q_avg'] = gdp_df['gdp_growth'].rolling(4, min_periods=1).mean()
+
+    has_date = df['breach_date'].notna()
+    for col in cols:
+        df[col] = np.nan
+
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
+        m = pd.merge_asof(
+            work, gdp_df,
+            left_on='breach_date', right_on='date',
+            direction='backward', tolerance=pd.Timedelta(days=120)
+        )
+        m.index = work.index
+        df.loc[m.index, 'gdp_growth_at_breach'] = m['gdp_growth'].round(2).values
+        df.loc[m.index, 'gdp_growth_4q_avg'] = m['gdp_growth_4q_avg'].round(2).values
+
+    enriched = df['gdp_growth_at_breach'].notna().sum()
+    logger.info("Enriched %d records with GDP data", enriched)
+    return df
+
+
+# =============================================================================
+# UNEMPLOYMENT RATE FROM FEDERAL RESERVE
+# =============================================================================
+# Fetches civilian unemployment rate (monthly, seasonally adjusted)
+# FRED series: UNRATE
+# =============================================================================
+
+def fetch_unemployment_data() -> pd.DataFrame:
+    """Fetch monthly unemployment rate from FRED."""
+    logger.info("Fetching unemployment data from FRED (UNRATE)")
+    try:
+        ur_df = _fetch_fred_series("UNRATE", "unemployment_rate")
+        ur_df = ur_df.sort_values('date').reset_index(drop=True)
+        logger.info("Retrieved %d monthly unemployment observations", len(ur_df))
+        return ur_df
+    except Exception as e:
+        logger.error("Error fetching unemployment data: %s", e)
+        return pd.DataFrame()
+
+
+def enrich_with_unemployment_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with unemployment rate metrics using vectorized merge_asof."""
+    ur_df = fetch_unemployment_data()
+    cols = ['unemployment_at_breach', 'unemployment_3m_avg', 'unemployment_12m_avg']
+
+    if ur_df.empty:
+        logger.warning("No unemployment data available, skipping enrichment")
+        for col in cols:
+            df[col] = None
+        return df
+
+    logger.info("Calculating unemployment metrics for %d breach records...", len(df))
+
+    # Precompute rolling averages on source data
+    ur_df['unemployment_3m_avg'] = ur_df['unemployment_rate'].rolling(3, min_periods=1).mean()
+    ur_df['unemployment_12m_avg'] = ur_df['unemployment_rate'].rolling(12, min_periods=1).mean()
+
+    has_date = df['breach_date'].notna()
+    for col in cols:
+        df[col] = np.nan
+
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
+        m = pd.merge_asof(
+            work, ur_df,
+            left_on='breach_date', right_on='date',
+            direction='backward', tolerance=pd.Timedelta(days=45)
+        )
+        m.index = work.index
+        df.loc[m.index, 'unemployment_at_breach'] = m['unemployment_rate'].round(2).values
+        df.loc[m.index, 'unemployment_3m_avg'] = m['unemployment_3m_avg'].round(2).values
+        df.loc[m.index, 'unemployment_12m_avg'] = m['unemployment_12m_avg'].round(2).values
+
+    enriched = df['unemployment_at_breach'].notna().sum()
+    logger.info("Enriched %d records with unemployment data", enriched)
+    return df
+
+
+# =============================================================================
+# INTEREST RATES FROM FEDERAL RESERVE
+# =============================================================================
+# Fetches three daily series from FRED:
+#   DFF   — Federal Funds Effective Rate
+#   DGS10 — 10-Year Treasury Constant Maturity Rate
+#   DGS2  — 2-Year Treasury Constant Maturity Rate
+# Yield spread = DGS10 - DGS2 (classic recession indicator)
+# =============================================================================
+
+def fetch_interest_rate_data() -> dict:
+    """
+    Fetch daily interest rate series from FRED.
+    Returns a dict of DataFrames keyed by series name.
+    """
+    logger.info("Fetching interest rate data from FRED (DFF, DGS10, DGS2)")
+    series = {
+        'fed_funds': ('DFF', 'fed_funds_rate'),
+        'treasury_10y': ('DGS10', 'treasury_10y'),
+        'treasury_2y': ('DGS2', 'treasury_2y'),
+    }
+    result = {}
+    for key, (series_id, col_name) in series.items():
+        try:
+            result[key] = _fetch_fred_series(series_id, col_name)
+            logger.info("  %s: %d observations", series_id, len(result[key]))
+        except Exception as e:
+            logger.error("Error fetching %s: %s", series_id, e)
+            result[key] = pd.DataFrame()
+    return result
+
+
+def enrich_with_interest_rate_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Enrich breach data with interest rate and yield curve metrics using vectorized merge_asof."""
+    rate_data = fetch_interest_rate_data()
+    cols = [
+        'fed_funds_rate_at_breach', 'treasury_10y_at_breach', 'treasury_2y_at_breach',
+        'yield_spread_10y2y_at_breach', 'fed_funds_rate_30d_avg', 'treasury_10y_30d_avg',
+    ]
+
+    all_empty = all(v.empty for v in rate_data.values())
+    if all_empty:
+        logger.warning("No interest rate data available, skipping enrichment")
+        for col in cols:
+            df[col] = None
+        return df
+
+    logger.info("Calculating interest rate metrics for %d breach records...", len(df))
+
+    has_date = df['breach_date'].notna()
+    for col in cols:
+        df[col] = np.nan
+
+    if has_date.any():
+        work = df.loc[has_date, ['breach_date']].copy().sort_values('breach_date')
+
+        # Point-in-time values — nearest within 7 days
+        series_map = {
+            'fed_funds': ('fed_funds_rate', 'fed_funds_rate_at_breach'),
+            'treasury_10y': ('treasury_10y', 'treasury_10y_at_breach'),
+            'treasury_2y': ('treasury_2y', 'treasury_2y_at_breach'),
+        }
+        for key, (val_col, at_col) in series_map.items():
+            sdf = rate_data.get(key, pd.DataFrame())
+            if sdf.empty:
+                continue
+            sdf = sdf.sort_values('date').reset_index(drop=True)
+            m = pd.merge_asof(
+                work, sdf, left_on='breach_date', right_on='date',
+                direction='nearest', tolerance=pd.Timedelta(days=7)
+            )
+            m.index = work.index
+            df.loc[m.index, at_col] = m[val_col].round(2).values
+
+        # Yield spread = 10Y - 2Y
+        t10 = df['treasury_10y_at_breach']
+        t2 = df['treasury_2y_at_breach']
+        both_valid = t10.notna() & t2.notna()
+        df.loc[both_valid, 'yield_spread_10y2y_at_breach'] = (t10[both_valid] - t2[both_valid]).round(2)
+
+    # 30-day trailing averages — vectorized via searchsorted
+    avg_series = {
+        'fed_funds': ('fed_funds_rate', 'fed_funds_rate_30d_avg'),
+        'treasury_10y': ('treasury_10y', 'treasury_10y_30d_avg'),
+    }
+    for key, (val_col, avg_col) in avg_series.items():
+        sdf = rate_data.get(key, pd.DataFrame())
+        if sdf.empty:
+            continue
+        sdf = sdf.sort_values('date').reset_index(drop=True)
+        df[avg_col] = _vectorized_window_avg(
+            sdf['date'], sdf[val_col], df['breach_date'],
+            days_before=30, days_after=0
+        ).round(2)
+
+    enriched = df['fed_funds_rate_at_breach'].notna().sum()
+    logger.info("Enriched %d records with interest rate data", enriched)
+    return df
+
+
+# =============================================================================
+# FINBERT SENTIMENT ANALYSIS
+# =============================================================================
+# Scores text using ProsusAI/finbert (BERT fine-tuned on financial text).
+# Used by model.py Step 6 to analyze breach disclosure tone.
+# Results cached to CSV to avoid recomputation (~2 min on first run).
+# =============================================================================
+
+
+def compute_finbert_sentiment(
+    texts: pd.Series,
+    cache_path: Path = None,
+    batch_size: int = 32,
+) -> pd.DataFrame:
+    """
+    Score texts using ProsusAI/finbert.
+
+    Returns DataFrame with columns:
+      sentiment_label, sentiment_score, prob_positive, prob_negative, prob_neutral
+
+    sentiment_score = P(positive) - P(negative), range [-1, +1].
+    Caches results to CSV to avoid recomputation.
+    """
+    if cache_path is None:
+        cache_path = OUTPUT_DIR / "sentiment_cache.csv"
+
+    # Check cache
+    if cache_path.exists():
+        cached = pd.read_csv(cache_path)
+        if len(cached) == len(texts):
+            logger.info("Loaded cached sentiment scores (%d rows) from %s", len(cached), cache_path)
+            return cached.reset_index(drop=True)
+        logger.info("Cache length mismatch (%d vs %d), recomputing", len(cached), len(texts))
+
+    logger.info("Computing FinBERT sentiment for %d texts (batch_size=%d)", len(texts), batch_size)
+
+    from transformers import pipeline as hf_pipeline
+
+    classifier = hf_pipeline(
+        "sentiment-analysis",
+        model="ProsusAI/finbert",
+        tokenizer="ProsusAI/finbert",
+        truncation=True,
+        max_length=512,
+    )
+
+    # Replace NaN/empty texts with a neutral placeholder
+    clean_texts = texts.fillna("").astype(str).tolist()
+    clean_texts = [t if t.strip() else "no information available" for t in clean_texts]
+
+    all_results = []
+    n_batches = (len(clean_texts) + batch_size - 1) // batch_size
+    for i in range(0, len(clean_texts), batch_size):
+        batch = clean_texts[i:i + batch_size]
+        batch_num = i // batch_size + 1
+        if batch_num % 10 == 1 or batch_num == n_batches:
+            logger.info("  Batch %d/%d", batch_num, n_batches)
+        preds = classifier(batch)
+        all_results.extend(preds)
+
+    # Parse results into structured DataFrame
+    records = []
+    for pred in all_results:
+        label = pred['label'].lower()  # positive, negative, neutral
+        score = pred['score']
+
+        # FinBERT returns the top label + its probability.
+        # We need all three probabilities to compute sentiment_score.
+        prob_positive = score if label == 'positive' else 0.0
+        prob_negative = score if label == 'negative' else 0.0
+        prob_neutral = score if label == 'neutral' else 0.0
+
+        records.append({
+            'sentiment_label': label,
+            'prob_positive': prob_positive,
+            'prob_negative': prob_negative,
+            'prob_neutral': prob_neutral,
+        })
+
+    result_df = pd.DataFrame(records)
+
+    # For a more precise sentiment_score, re-run with return_all_scores
+    # But the single-label approach is much faster and sufficient for regime splits.
+    # sentiment_score: +1 = fully positive, -1 = fully negative, ~0 = neutral
+    result_df['sentiment_score'] = result_df['prob_positive'] - result_df['prob_negative']
+
+    # Cache results
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    result_df.to_csv(cache_path, index=False)
+    logger.info("Cached sentiment scores to %s", cache_path)
+
+    # Summary
+    label_counts = result_df['sentiment_label'].value_counts()
+    logger.info("Sentiment distribution: %s", label_counts.to_dict())
+
+    return result_df
+
+
+def _build_article_text(article: dict, source: str) -> str:
+    """Build scoreable text from a news article dict."""
+    if source == 'reddit':
+        return (article.get('title') or '').strip()
+    elif source == 'guardian':
+        title = (article.get('title') or '').strip()
+        trail = re.sub(r'<[^>]+>', '', (article.get('trail_text') or ''))
+        return f"{title}. {trail}".strip('. ') if trail.strip() else title
+    elif source == 'nyt':
+        title = (article.get('title') or '').strip()
+        lead = (article.get('lead_paragraph') or '').strip()
+        return f"{title}. {lead}".strip('. ') if lead else title
+    return ''
+
+
+def compute_lagged_news_sentiment(
+    df: pd.DataFrame,
+    windows: list = None,
+    cache_path: Path = None,
+) -> pd.DataFrame:
+    """
+    Compute pre-breach lagged news sentiment for each event.
+
+    Two-level cache strategy:
+      1. news_lagged_sentiment.csv (aggregated per event) — return immediately
+      2. news_articles_scored.csv (article-level) — skip FinBERT, just re-aggregate
+      3. Otherwise: parse JSONs → score with FinBERT → aggregate → cache both
+
+    Returns DataFrame aligned to df.index with columns:
+      news_sent_{w}d, news_count_{w}d for each window w
+    """
+    if windows is None:
+        windows = [7, 30, 60]
+    if cache_path is None:
+        cache_path = OUTPUT_DIR / "news_lagged_sentiment.csv"
+    scored_cache = OUTPUT_DIR / "news_articles_scored.csv"
+
+    expected_cols = []
+    for w in windows:
+        expected_cols += [f'news_sent_{w}d', f'news_count_{w}d']
+
+    # --- Level 1 cache: aggregated results ---
+    if cache_path.exists():
+        cached = pd.read_csv(cache_path)
+        if len(cached) == len(df) and all(c in cached.columns for c in expected_cols):
+            logger.info("Loaded cached lagged news sentiment (%d rows) from %s", len(cached), cache_path)
+            return cached[expected_cols].reset_index(drop=True)
+        logger.info("Aggregated cache invalid (rows: %d vs %d), recomputing", len(cached), len(df))
+
+    # --- Parse articles from JSON columns ---
+    articles_scored = None
+    if scored_cache.exists():
+        try:
+            articles_scored = pd.read_csv(scored_cache)
+            if 'sentiment_score' not in articles_scored.columns:
+                articles_scored = None
+                logger.info("Scored cache missing sentiment_score, will rescore")
+            else:
+                logger.info("Loaded scored articles cache (%d rows)", len(articles_scored))
+        except Exception:
+            articles_scored = None
+
+    if articles_scored is None:
+        # Parse all articles from JSON columns
+        logger.info("Parsing news articles from JSON columns...")
+        article_records = []
+        json_cols = {
+            'reddit_articles_json': 'reddit',
+            'guardian_articles_json': 'guardian',
+            'nyt_articles_json': 'nyt',
+        }
+
+        for row_idx, row in df.iterrows():
+            for col, source in json_cols.items():
+                raw = row.get(col)
+                if pd.isna(raw) or not raw:
+                    continue
+                try:
+                    articles = json.loads(raw) if isinstance(raw, str) else raw
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(articles, list):
+                    continue
+                for art in articles:
+                    if not isinstance(art, dict):
+                        continue
+                    text = _build_article_text(art, source)
+                    if not text:
+                        continue
+                    pub_date = art.get('published_date') or art.get('pub_date')
+                    article_records.append({
+                        'row_idx': row_idx,
+                        'source': source,
+                        'text': text,
+                        'published_date': pub_date,
+                    })
+
+        logger.info("Parsed %d articles from %d events", len(article_records), len(df))
+
+        if not article_records:
+            # No articles found — return empty results
+            result = pd.DataFrame(index=df.index)
+            for w in windows:
+                result[f'news_sent_{w}d'] = np.nan
+                result[f'news_count_{w}d'] = 0
+            return result[expected_cols].reset_index(drop=True)
+
+        articles_df = pd.DataFrame(article_records)
+
+        # Score all article texts with FinBERT
+        logger.info("Scoring %d article texts with FinBERT...", len(articles_df))
+        sentiment_results = compute_finbert_sentiment(
+            articles_df['text'],
+            cache_path=OUTPUT_DIR / "news_article_sentiment_cache.csv",
+            batch_size=32,
+        )
+        articles_df['sentiment_score'] = sentiment_results['sentiment_score'].values
+        articles_df['sentiment_label'] = sentiment_results['sentiment_label'].values
+
+        # Cache scored articles
+        OUTPUT_DIR.mkdir(exist_ok=True)
+        articles_df.to_csv(scored_cache, index=False)
+        logger.info("Cached scored articles to %s", scored_cache)
+        articles_scored = articles_df
+
+    # --- Aggregate by window ---
+    logger.info("Aggregating sentiment by pre-breach windows: %s", windows)
+
+    # Parse dates
+    articles_scored['pub_dt'] = pd.to_datetime(articles_scored['published_date'], format='mixed', errors='coerce')
+
+    # Map reported_date from df onto articles
+    reported_dates = df['reported_date']
+    articles_scored['reported_date'] = articles_scored['row_idx'].map(reported_dates)
+    articles_scored['reported_date'] = pd.to_datetime(articles_scored['reported_date'], format='mixed', errors='coerce')
+
+    # Compute days before breach
+    articles_scored['days_before'] = (articles_scored['reported_date'] - articles_scored['pub_dt']).dt.days
+
+    result = pd.DataFrame(index=df.index)
+    for w in windows:
+        in_window = articles_scored[
+            (articles_scored['days_before'] >= 1) &
+            (articles_scored['days_before'] <= w)
+        ]
+        agg = in_window.groupby('row_idx')['sentiment_score'].agg(['mean', 'count'])
+        agg.columns = [f'news_sent_{w}d', f'news_count_{w}d']
+        # Reindex to df.index, fill missing
+        agg = agg.reindex(df.index)
+        agg[f'news_count_{w}d'] = agg[f'news_count_{w}d'].fillna(0).astype(int)
+        result[f'news_sent_{w}d'] = agg[f'news_sent_{w}d']
+        result[f'news_count_{w}d'] = agg[f'news_count_{w}d']
+
+    # Cache aggregated results
+    OUTPUT_DIR.mkdir(exist_ok=True)
+    result.to_csv(cache_path, index=False)
+    logger.info("Cached lagged news sentiment to %s", cache_path)
+
+    # Summary
+    for w in windows:
+        has_data = (result[f'news_count_{w}d'] > 0).sum()
+        logger.info("Window %dd: %d/%d events with articles (%.1f%%)",
+                     w, has_data, len(df), 100 * has_data / len(df))
+
+    return result[expected_cols].reset_index(drop=True)
+
+
 def main():
     """Main entry point for the cleaning pipeline."""
-    # Load raw data source
     df = load_breach_data("Data_Breach_Enriched_Final.csv")
-
-    # Display initial data info
     logger.info("Columns: %s", list(df.columns))
     logger.info("Shape: %s", df.shape)
 
-    # Run cleaning pipeline
-    df_cleaned = clean_pipeline(df)
+    # Clean
+    df = clean_pipeline(df)
 
-    # Enrich with stock data from Yahoo Finance
-    df_enriched = enrich_with_stock_data(df_cleaned)
+    # Enrich — each stage adds columns and returns the DataFrame
+    df = enrich_with_stock_data(df)
+    df = enrich_with_news_data(df)
+    df = enrich_with_vix_data(df)
+    df = enrich_with_fama_french_data(df)
+    df = enrich_with_inflation_data(df)
+    df = enrich_with_gdp_data(df)
+    df = enrich_with_unemployment_data(df)
+    df = enrich_with_interest_rate_data(df)
 
-    # Enrich with news data from Reddit, Guardian, NYT
-    df_with_news = enrich_with_news_data(df_enriched)
-
-    # Enrich with VIX (Volatility Index) data from Federal Reserve
-    df_with_vix = enrich_with_vix_data(df_with_news)
-
-    # Enrich with Fama-French 5-Factor data from Kenneth French Data Library
-    df_with_ff = enrich_with_fama_french_data(df_with_vix)
-
-    # Save enriched data
-    save_cleaned_data(df_with_ff, "breach_data_enriched.csv")
-
-    return df_with_ff
+    save_cleaned_data(df, "breach_data_enriched.csv")
+    return df
 
 
 if __name__ == "__main__":
@@ -1646,6 +2178,115 @@ DATA_DICTIONARY = {
                 "pandas_dtype": "float64",
                 "nullable": True,
                 "description": "Average CMA in 90-day window around breach (+/- 45 days)",
+            },
+            # --- Inflation / CPI Data from Federal Reserve (CPIAUCSL, monthly) ---
+            "cpi_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(10,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Consumer Price Index (CPI-U) at most recent month before breach",
+            },
+            "inflation_yoy_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Year-over-year CPI inflation rate (%) at breach date",
+            },
+            "inflation_yoy_3m_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "3-month average of YoY inflation rate ending at breach month",
+            },
+            "inflation_yoy_12m_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "12-month average of YoY inflation rate ending at breach month",
+            },
+            # --- GDP Growth Data from Federal Reserve (A191RL1Q225SBEA, quarterly) ---
+            "gdp_growth_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Real GDP growth rate (% change SAAR) at most recent quarter before breach",
+            },
+            "gdp_growth_4q_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(8,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "4-quarter average of real GDP growth rate ending at breach quarter",
+            },
+            # --- Unemployment Rate from Federal Reserve (UNRATE, monthly) ---
+            "unemployment_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Civilian unemployment rate (%) at most recent month before breach",
+            },
+            "unemployment_3m_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "3-month average unemployment rate ending at breach month",
+            },
+            "unemployment_12m_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "12-month average unemployment rate ending at breach month",
+            },
+            # --- Interest Rates from Federal Reserve (DFF, DGS10, DGS2, daily) ---
+            "fed_funds_rate_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Federal Funds Effective Rate (%) at breach date",
+            },
+            "treasury_10y_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "10-Year Treasury Constant Maturity Rate (%) at breach date",
+            },
+            "treasury_2y_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "2-Year Treasury Constant Maturity Rate (%) at breach date",
+            },
+            "yield_spread_10y2y_at_breach": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "Yield spread (10Y - 2Y Treasury), negative values signal potential recession",
+            },
+            "fed_funds_rate_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "30-day average Federal Funds Rate ending at breach date",
+            },
+            "treasury_10y_30d_avg": {
+                "python_type": "float",
+                "sql_type": "DECIMAL(6,2)",
+                "pandas_dtype": "float64",
+                "nullable": True,
+                "description": "30-day average 10-Year Treasury Rate ending at breach date",
             },
         },
     }
