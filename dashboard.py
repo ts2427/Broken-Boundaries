@@ -1,6 +1,7 @@
 """
 dashboard.py - Executive Briefing Dashboard for Broken Boundaries
 Presidential-briefing-quality visualization of the 8-step data breach analysis pipeline.
+Orchestrates the full pipeline (clean -> ETL -> model -> visual) then displays results.
 """
 
 import streamlit as st
@@ -8,6 +9,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 from io import BytesIO
+import logging
 
 import database as db
 
@@ -25,6 +27,75 @@ st.set_page_config(
 BASE_DIR = Path(__file__).parent
 CLEANED_DIR = BASE_DIR / "cleaned"
 RAW_CSV = BASE_DIR / "Data_Breach_Enriched_Final.csv"
+
+
+# =============================================================================
+# PIPELINE ORCHESTRATION
+# =============================================================================
+
+@st.cache_resource
+def run_pipeline():
+    """
+    Run the complete analysis pipeline: clean -> ETL -> model -> visual.
+    Cached so it only runs once per Streamlit process lifecycle.
+    """
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        force=True,
+    )
+
+    # Step 1: Clean & enrich raw data
+    from clean import main as clean_main
+    clean_main()
+
+    # Step 2: Load into SQLite database
+    from etl import run_etl
+    run_etl()
+
+    # Step 3: Run 8-step statistical analysis
+    from model import (
+        load_enriched_data,
+        print_full_descriptive_statistics,
+        run_ols_fama_french,
+        run_ols_with_macro_controls,
+        run_ols_breach_level,
+        run_event_study,
+        run_sentiment_analysis,
+        run_lagged_sentiment_analysis,
+        run_repeat_offender_analysis,
+    )
+
+    df = load_enriched_data()
+    stats = print_full_descriptive_statistics(df)
+    ols_results = run_ols_fama_french()
+    macro_results = run_ols_with_macro_controls()
+    breach_results, _breach_data = run_ols_breach_level(df)
+    event_results = run_event_study(df)
+    sentiment_results = run_sentiment_analysis(df, event_results)
+    lagged_results = run_lagged_sentiment_analysis(df, event_results, sentiment_results)
+    repeat_results = run_repeat_offender_analysis(df, event_results, lagged_results)
+
+    db.store_all_results({
+        "step1": stats,
+        "step2": ols_results,
+        "step3": macro_results,
+        "step4": breach_results,
+        "step5": event_results,
+        "step6": sentiment_results,
+        "step7": lagged_results,
+        "step8": repeat_results,
+    })
+
+    # Step 4: Generate 21 publication figures
+    from visual import main as visual_main
+    visual_main()
+
+    return True
+
+
+with st.spinner("Running analysis pipeline..."):
+    run_pipeline()
 
 NAVY = "#1B2A4A"
 GOLD = "#C5A55A"
