@@ -1,0 +1,27 @@
+# Environment variables (API keys)
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+
+# Output files
+cleaned/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Database WAL
+*.db-wal
+*.db-shm
+
+# OS
+.DS_Store
+Thumbs.db
+logs/
